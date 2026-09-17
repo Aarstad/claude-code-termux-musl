@@ -64,6 +64,9 @@ Three Android facts break the stock binary. Each has a one-line answer:
 **1. The interpreter path.** The musl build asks for `/lib/ld-musl-aarch64.so.1`. Android
 has no `/lib`, and you can't create one without root. So the loader (from Alpine's `musl`
 package) goes in `$PREFIX/lib`, and `patchelf --set-interpreter` repoints the binary at it.
+That single field is the only edit: no rpath is set, and none is needed — the binary's one
+`DT_NEEDED` is `libc.musl-aarch64.so.1`, and musl's loader *is* libc, registering itself
+under that name. One 723KB file satisfies both roles.
 
 This is more than cosmetic: because the binary is then executed *directly* rather than as
 an argument to a loader, `/proc/self/exe` is correct. Claude Code derives

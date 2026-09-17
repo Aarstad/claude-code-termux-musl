@@ -109,10 +109,10 @@ version instead — all published versions are a ~7s re-fetch away.
 
 ## Caveats
 
-- **If you also have wallentx's launcher, its updater will clobber `claude`.**
+- **The two launchers both want the name `claude`.** If you also run wallentx's,
   `claude-termux-update` installs `(claude.glibc, claude-termux-update, claude)` into
-  `$PREFIX/bin`, overwriting the promoted symlink and putting you silently back on glibc.
-  Recover with `ln -sf claude-musl $PREFIX/bin/claude`.
+  `$PREFIX/bin`, which replaces the promoted symlink and puts you back on glibc without
+  announcing it. Recover with `ln -sf claude-musl $PREFIX/bin/claude`.
 - **In-session `grep` is not GNU grep.** Claude Code's shim routes it to its bundled ugrep
   with `--ignore-files --hidden -I -G`, so gitignored files are skipped — an empty result
   can mean "ignored", not "absent". Use `command grep` when a negative result matters.

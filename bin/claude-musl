@@ -26,36 +26,39 @@ export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
 # Updates go through the existing claude-termux-update / a fresh musl install.
 export DISABLE_AUTOUPDATER=1
 
+die() { echo "claude-musl: $*" >&2; exit 1; }
+
 PROXY_PID=""
 cleanup() { [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
 if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
-  FIFO="$(mktemp -u)"
-  if mkfifo "$FIFO" 2>/dev/null; then
-    # Either runtime runs the proxy unchanged, but bun boots in ~30ms against node's
-    # ~290ms on this device, and that cost is paid on every launch. Both are bionic
-    # builds, which is the part that matters: only bionic can ask Android for a resolver.
-    RUNTIME="${CLAUDE_MUSL_RUNTIME:-}"
-    [ -n "$RUNTIME" ] || { command -v bun >/dev/null 2>&1 && RUNTIME=bun || RUNTIME=node; }
-    "$RUNTIME" "$LIBEXEC/dns-proxy.js" > "$FIFO" &
-    PROXY_PID=$!
-    PORT=""
-    read -r -t 15 PORT < "$FIFO"          # blocks until the proxy reports its port
-    rm -f "$FIFO"
-    if [ -n "$PORT" ]; then
-      export http_proxy="http://127.0.0.1:$PORT"
-      export https_proxy="$http_proxy"
-      export HTTP_PROXY="$http_proxy"
-      export HTTPS_PROXY="$http_proxy"
-      export all_proxy="$http_proxy"
-      export CLAUDE_CODE_PROXY_RESOLVES_HOSTS=true
-    else
-      echo "claude-musl: DNS proxy did not start; network will likely fail" >&2
-      cleanup; PROXY_PID=""
-    fi
+  # Either runtime runs the proxy unchanged, but bun boots in ~30ms against node's
+  # ~290ms on this device, and that cost is paid on every launch. Both are bionic
+  # builds, which is the part that matters: only bionic can ask Android for a resolver.
+  RUNTIME="${CLAUDE_MUSL_RUNTIME:-}"
+  [ -n "$RUNTIME" ] || { command -v bun >/dev/null 2>&1 && RUNTIME=bun || RUNTIME=node; }
+  command -v "$RUNTIME" >/dev/null 2>&1 || die "need bun or node for the DNS proxy (pkg install bun)"
+
+  # A coprocess rather than a fifo: it needs no mkfifo binary, and bash hands back both
+  # the pipe and the pid. Reading one line blocks until the proxy reports its port.
+  coproc PROXY { "$RUNTIME" "$LIBEXEC/dns-proxy.js"; }
+  PROXY_PID=$PROXY_PID
+  PORT=""
+  read -r -t 15 PORT <&"${PROXY[0]}" || true
+
+  if [ -n "$PORT" ]; then
+    export http_proxy="http://127.0.0.1:$PORT"
+    export https_proxy="$http_proxy"
+    export HTTP_PROXY="$http_proxy"
+    export HTTPS_PROXY="$http_proxy"
+    export all_proxy="$http_proxy"
+    export CLAUDE_CODE_PROXY_RESOLVES_HOSTS=true
   else
-    echo "claude-musl: could not create a fifo; running without the DNS proxy" >&2
+    # Without it, DNS inside the musl process hangs for minutes rather than failing,
+    # which is a worse experience than stopping here.
+    cleanup; PROXY_PID=""
+    die "the DNS proxy did not start; set CLAUDE_MUSL_NO_PROXY=1 to run without it anyway"
   fi
 fi
 

@@ -35,6 +35,9 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 [ -d "$PREFIX/bin" ] || die "no $PREFIX/bin — this installs into Termux"
 command -v curl >/dev/null || die "curl is required (pkg install curl)"
 command -v tar  >/dev/null || die "tar is required"
+# tar shells out to gzip; without it the extraction fails in a way that looks like a
+# corrupt download rather than a missing tool.
+command -v gzip >/dev/null || die "gzip is required (pkg install gzip)"
 
 if ! command -v patchelf >/dev/null; then
   say "installing patchelf"
@@ -61,8 +64,10 @@ else
   apk="$(curl -fsSL "$ALPINE/" | sed -n 's/.*href="\(musl-[0-9][^"]*\.apk\)".*/\1/p' | head -1)"
   [ -n "$apk" ] || die "could not find a musl package at $ALPINE"
   curl -fsSL -o "$tmp/musl.apk" "$ALPINE/$apk"
-  tar xzf "$tmp/musl.apk" -C "$tmp" 2>/dev/null || true
-  [ -f "$tmp/lib/ld-musl-aarch64.so.1" ] || die "no loader inside $apk"
+  # An .apk is concatenated gzip streams; tar reads the first, which holds the files.
+  # Its exit status is not meaningful here, but its stderr is, so it is left visible.
+  tar xzf "$tmp/musl.apk" -C "$tmp" || true
+  [ -f "$tmp/lib/ld-musl-aarch64.so.1" ] || die "no loader inside $apk (extraction failed?)"
   mkdir -p "$(dirname "$LOADER")"
   install -m 755 "$tmp/lib/ld-musl-aarch64.so.1" "$LOADER"
   rm -rf "$tmp"; trap - EXIT

@@ -41,6 +41,13 @@ done
 
 die() { echo "claude-musl-update: $*" >&2; exit 1; }
 
+# Same choice the wrapper makes: bun if present, else node. Only used for parsing the
+# registry response and checking the download's hash, so either is fine — but hardcoding
+# node would strand a bun-only device at the first fetch.
+JS="${CLAUDE_MUSL_RUNTIME:-}"
+[ -n "$JS" ] || { command -v bun >/dev/null 2>&1 && JS=bun || JS=node; }
+command -v "$JS" >/dev/null 2>&1 || die "need bun or node (pkg install bun)"
+
 [ -x "$LOADER" ] || die "missing musl loader at $LOADER"
 
 if [ "$ROLLBACK" = 1 ]; then
@@ -56,13 +63,13 @@ current="$("$BIN" --version 2>/dev/null | awk '{print $1}')"
 [ -n "$current" ] || current="(none installed)"
 
 # Ask npm what the latest musl build is, and how to verify it.
-# No -f: a 404 body still carries the registry's reason, which node reports below.
+# No -f: a 404 body still carries the registry's reason, which $JS reports below.
 meta="$(timeout 120 curl -sSL "https://registry.npmjs.org/$PKG/${WANT:-latest}" 2>/dev/null)" \
   || die "could not reach the npm registry"
 [ -n "$meta" ] || die "empty response from the npm registry"
 # Note the status has to be checked on the substitution itself: `read` from an empty
 # here-string still succeeds, which would leave the version blank and reach curl.
-info="$(printf '%s' "$meta" | node -e '
+info="$(printf '%s' "$meta" | "$JS" -e '
 let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
   let j; try{ j=JSON.parse(s); }catch(e){ console.error(s.trim().slice(0,120)||"bad registry response"); process.exit(1); }
   if(!j.version || !j.dist || !j.dist.tarball){ console.error(j.error||"no such version"); process.exit(1); }
@@ -99,7 +106,7 @@ if [ -t 2 ]; then PROG=--progress-bar; else PROG=--no-progress-meter; fi
 timeout 900 curl -fL $PROG --retry 3 --retry-delay 2 -o "$work/pkg.tgz" "$tarball" || die "download failed"
 
 if [ -n "$integrity" ]; then
-  printf '%s' "$integrity" | node -e '
+  printf '%s' "$integrity" | "$JS" -e '
     const fs=require("fs"), crypto=require("crypto");
     let want=""; process.stdin.on("data",d=>want+=d).on("end",()=>{
       want=want.trim();

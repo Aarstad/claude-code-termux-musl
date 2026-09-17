@@ -66,12 +66,20 @@ server.listen(0, "127.0.0.1", () => {
   console.log(server.address().port);
 });
 
+// The wrapper starts us as a coprocess, so our stdin is a pipe it holds open. When it
+// exits — however it exits — the write end closes and we read EOF. That is immediate and
+// involves no pid arithmetic, unlike the watchdog below, which can be fooled by pid reuse.
+process.stdin.on("end", () => process.exit(0));
+process.stdin.on("error", () => process.exit(0));
+process.stdin.resume();
+
 // The wrapper kills us on exit; this is the backstop for when it is killed outright.
 // Watching process.ppid alone assumes it is re-read rather than cached, and that
 // reparenting is visible — neither is guaranteed across runtimes. Signal 0 against the
 // original parent asks the kernel directly and is the same question in every runtime.
 const startedUnder = process.ppid;
 const watch = setInterval(() => {
+  if (!startedUnder) return; // 0 would signal the whole process group, which always succeeds
   try {
     process.kill(startedUnder, 0);
   } catch {

@@ -63,7 +63,11 @@ server.on("connect", (req, client, head) => {
 server.on("clientError", (_err, socket) => socket.destroy());
 
 server.listen(0, "127.0.0.1", () => {
-  console.log(server.address().port);
+  // Report the port, then close stdout for good. The wrapper reads this one line and never
+  // reads again, so anything written afterwards would sit in a 64KB pipe and then block
+  // this process forever — alive, unkillable-looking, with DNS silently dead. Closing the
+  // stream makes that impossible rather than a convention to remember. Logs go to stderr.
+  process.stdout.write(server.address().port + "\n", () => process.stdout.end());
 });
 
 // The wrapper starts us as a coprocess, so our stdin is a pipe it holds open. When it

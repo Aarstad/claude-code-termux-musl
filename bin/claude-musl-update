@@ -1,0 +1,133 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# claude-musl-update — update the musl build of Claude Code that claude-musl runs.
+#
+# The built-in updater is off (claude-musl sets DISABLE_AUTOUPDATER=1) because it
+# would fetch the linux-arm64 *glibc* build over this install. This fetches the musl
+# build from npm instead, repoints its interpreter at $PREFIX/lib/ld-musl-aarch64.so.1
+# with patchelf, checks the result actually runs, and only then swaps it in.
+#
+#   claude-musl-update              update to the latest published version
+#   claude-musl-update --check      report versions, change nothing
+#   claude-musl-update --force      reinstall even if already current
+#   claude-musl-update --version X  install a specific version
+#   claude-musl-update --channel C  follow a channel: stable, latest (default) or next
+#   claude-musl-update --rollback   restore the previous binary
+#   claude-musl-update --no-backup  do not keep the previous binary (saves ~212MB)
+#
+set -uo pipefail
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+LIBEXEC="$PREFIX/libexec/claude-musl"
+BIN="$LIBEXEC/claude"
+PREV="$LIBEXEC/claude.prev"
+LOADER="$PREFIX/lib/ld-musl-aarch64.so.1"
+PKG="@anthropic-ai/claude-code-linux-arm64-musl"
+NEED_MB=520          # tarball + extracted copy + backup, with headroom
+
+CHECK=0; FORCE=0; WANT=""; BACKUP=1; ROLLBACK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)     CHECK=1 ;;
+    --force)     FORCE=1 ;;
+    --no-backup) BACKUP=0 ;;
+    --rollback)  ROLLBACK=1 ;;
+    --version)   shift; WANT="${1:-}" ;;
+    --channel)   shift; WANT="${1:-latest}" ;;   # npm dist-tags: stable | latest | next
+    -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)           echo "claude-musl-update: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+die() { echo "claude-musl-update: $*" >&2; exit 1; }
+
+[ -x "$LOADER" ] || die "missing musl loader at $LOADER"
+
+if [ "$ROLLBACK" = 1 ]; then
+  [ -f "$PREV" ] || die "no previous binary at $PREV"
+  mv -f "$PREV" "$BIN.rollback.$$" && mv -f "$BIN" "$PREV" && mv -f "$BIN.rollback.$$" "$BIN" \
+    || die "rollback failed"
+  echo "rolled back to $("$BIN" --version 2>/dev/null || echo unknown)"
+  echo "(the version you rolled away from is kept at $PREV)"
+  exit 0
+fi
+
+current="$("$BIN" --version 2>/dev/null | awk '{print $1}')"
+[ -n "$current" ] || current="(none installed)"
+
+# Ask npm what the latest musl build is, and how to verify it.
+# No -f: a 404 body still carries the registry's reason, which node reports below.
+meta="$(timeout 120 curl -sSL "https://registry.npmjs.org/$PKG/${WANT:-latest}" 2>/dev/null)" \
+  || die "could not reach the npm registry"
+[ -n "$meta" ] || die "empty response from the npm registry"
+# Note the status has to be checked on the substitution itself: `read` from an empty
+# here-string still succeeds, which would leave the version blank and reach curl.
+info="$(printf '%s' "$meta" | node -e '
+let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+  let j; try{ j=JSON.parse(s); }catch(e){ console.error(s.trim().slice(0,120)||"bad registry response"); process.exit(1); }
+  if(!j.version || !j.dist || !j.dist.tarball){ console.error(j.error||"no such version"); process.exit(1); }
+  console.log(j.version, j.dist.tarball, j.dist.integrity||"");
+})' 2>&1)" || die "$info"
+read -r version tarball integrity <<<"$info"
+[ -n "$version" ] && [ -n "$tarball" ] || die "could not determine which version to install"
+
+echo "installed: $current"
+echo "available: $version${WANT:+  (${WANT})}"
+
+if [ "$CHECK" = 1 ]; then
+  [ "$current" = "$version" ] && echo "up to date." || echo "run without --check to update."
+  exit 0
+fi
+if [ "$current" = "$version" ] && [ "$FORCE" != 1 ]; then
+  echo "already current; use --force to reinstall."
+  exit 0
+fi
+
+avail_mb="$(df -Pm "$LIBEXEC" 2>/dev/null | awk 'NR==2{print $4}')"
+if [ -n "$avail_mb" ] && [ "$avail_mb" -lt "$NEED_MB" ]; then
+  die "need about ${NEED_MB}MB free, have ${avail_mb}MB"
+fi
+
+# Staged inside $LIBEXEC so the final move is a rename on the same filesystem.
+work="$(mktemp -d "$LIBEXEC/.update.XXXXXX")" || die "could not create a work directory"
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT INT TERM
+
+echo "downloading $version …"
+# a bar when someone is watching, nothing when this runs from cron or a log
+if [ -t 2 ]; then PROG=--progress-bar; else PROG=--no-progress-meter; fi
+timeout 900 curl -fL $PROG --retry 3 --retry-delay 2 -o "$work/pkg.tgz" "$tarball" || die "download failed"
+
+if [ -n "$integrity" ]; then
+  printf '%s' "$integrity" | node -e '
+    const fs=require("fs"), crypto=require("crypto");
+    let want=""; process.stdin.on("data",d=>want+=d).on("end",()=>{
+      want=want.trim();
+      const [alg,b64]=want.split("-",2);
+      const h=crypto.createHash(alg).update(fs.readFileSync(process.argv[1])).digest("base64");
+      if(h!==b64){ console.error("integrity mismatch: registry says "+want); process.exit(1); }
+    });' "$work/pkg.tgz" || die "downloaded file failed its integrity check"
+  echo "integrity ok"
+fi
+
+tar xzf "$work/pkg.tgz" -C "$work" || die "could not unpack the tarball"
+new="$work/package/claude"
+[ -f "$new" ] || die "no claude binary inside the tarball"
+
+patchelf --set-interpreter "$LOADER" "$new" || die "patchelf failed"
+chmod 755 "$new"
+
+# Prove it runs before anything is replaced.
+got="$(timeout 60 env -u LD_PRELOAD "$new" --version 2>&1 | awk '{print $1}')"
+[ "$got" = "$version" ] || die "the new binary did not run (said: ${got:-nothing}); nothing was changed"
+echo "verified: $got runs"
+
+if [ "$BACKUP" = 1 ] && [ -f "$BIN" ]; then
+  mv -f "$BIN" "$PREV" || die "could not set the previous version aside"
+fi
+mv -f "$new" "$BIN" || die "could not move the new binary into place"
+chmod 755 "$BIN"
+
+echo "installed $version at $BIN"
+[ "$BACKUP" = 1 ] && [ -f "$PREV" ] && echo "previous kept at $PREV (claude-musl-update --rollback, or delete to save ~$(du -m "$PREV" | awk '{print $1}')MB)"
+exit 0

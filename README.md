@@ -6,6 +6,13 @@ It uses Anthropic's own `linux-arm64-musl` build — the one published for Alpin
 solves the three Android-specific problems that stop it running as-is. The result launches
 in about **150ms** and needs a **723KB** musl loader instead of a 449MB glibc runtime.
 
+Nothing here reimplements or repackages Claude Code: `install.sh` fetches Anthropic's
+published binary from npm, verifies its `sha512`, and changes exactly one field in its ELF
+header — the interpreter path. Logging in works as it does on any supported platform.
+
+(Timings and sizes throughout are measured on one device — a Snapdragon-class Android
+phone running Termux. Your numbers will differ; the ratios should not.)
+
 ```
 $ claude-musl --version
 2.1.274 (Claude Code)
@@ -39,7 +46,7 @@ same official binary runs directly on bionic.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/claude-code-termux-musl
+git clone https://github.com/Aarstad/claude-code-termux-musl
 cd claude-code-termux-musl
 ./install.sh              # installs `claude-musl`
 ./install.sh --promote    # …and makes it the default `claude`

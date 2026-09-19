@@ -30,17 +30,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 // Request headers we buffer before deciding what to do. Anything past this without a
 // complete header block is a client we do not want to serve.
 #define REQ_MAX 16384
+// How long a connection may sit in ST_HEADER without completing its request line and
+// headers. A client that connects and then says nothing otherwise holds a slot and a
+// 16KB buffer forever; the watchdog timer is already ticking, so the sweep is free.
+#define HEADER_TIMEOUT 30
 // Pipe capacity for splice(). 64K matches the default Linux pipe size; asking for more
 // needs privileges we do not have.
 #define PIPE_CAP 65536
-#define MAX_CONNS 512
+// The connection table is indexed by fd, so this is an fd ceiling, not a connection
+// ceiling. A tunnel costs six fds: a socket and a pipe pair on each side. With the four
+// fixed fds (epoll, stdin, timerfd, listener) that is roughly 85 concurrent tunnels
+// before accept() starts refusing. Sized for one Claude Code session, which opens a
+// handful; raising it is a one-line change if that ever stops being true.
+#define MAX_FDS 512
 
 enum { ST_HEADER, ST_TUNNEL };
 
@@ -56,9 +67,10 @@ struct conn {
   int want_out;       // peer's socket buffer was full; we are waiting for it to drain
   char *req;          // header buffer, allocated only while state == ST_HEADER
   int req_len;
+  time_t born;        // for the ST_HEADER idle sweep; unused once tunnelled
 };
 
-static struct conn *conns[MAX_CONNS];
+static struct conn *conns[MAX_FDS];
 static int epfd;
 
 // ---- small helpers -------------------------------------------------------------------
@@ -68,18 +80,41 @@ static void set_nonblock(int fd) {
   if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK);
 }
 
+// A short write on a non-blocking socket is not an error, it is a partial send -- and
+// dropping the remainder corrupts the stream with no diagnostic. These writes happen
+// before the connection is spliced, so blocking briefly here is safe and simpler than
+// carrying a pending-write buffer. Returns 0 if the peer is gone.
+static int write_all(int fd, const char *buf, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t w = write(fd, buf + off, len - off);
+    if (w > 0) { off += (size_t)w; continue; }
+    if (w < 0 && errno == EINTR) continue;
+    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // Wait for room rather than spinning; this is a handful of bytes at setup time.
+      struct pollfd pf = { .fd = fd, .events = POLLOUT };
+      if (poll(&pf, 1, 5000) <= 0) return 0;
+      continue;
+    }
+    return 0;
+  }
+  return 1;
+}
+
 static struct conn *conn_get(int fd) {
-  return (fd >= 0 && fd < MAX_CONNS) ? conns[fd] : NULL;
+  return (fd >= 0 && fd < MAX_FDS) ? conns[fd] : NULL;
 }
 
 static struct conn *conn_new(int fd) {
-  if (fd >= MAX_CONNS) return NULL; // refuse rather than index out of bounds
+  // Same bounds as conn_get: a negative fd would index behind the table.
+  if (fd < 0 || fd >= MAX_FDS) return NULL;
   struct conn *c = calloc(1, sizeof *c);
   if (!c) return NULL;
   c->fd = fd;
   c->peer = -1;
   c->pipe_r = c->pipe_w = -1;
   c->state = ST_HEADER;
+  c->born = time(NULL);
   conns[fd] = c;
   return c;
 }
@@ -173,7 +208,7 @@ static int pump(struct conn *c) {
 static void fail(struct conn *c, const char *status) {
   char buf[128];
   int n = snprintf(buf, sizeof buf, "HTTP/1.1 %s\r\nConnection: close\r\n\r\n", status);
-  (void)!write(c->fd, buf, (size_t)n); // best effort; we are closing regardless
+  (void)write_all(c->fd, buf, (size_t)n); // best effort; we are closing regardless
   conn_close(c);
 }
 
@@ -203,6 +238,9 @@ static int dial(const char *host, const char *port) {
   if (fd >= 0) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); // it is a tunnel; do not batch
+    // Non-blocking is set *after* connect(), on purpose: the connect above is meant to be
+    // synchronous, for the same reason the resolve above it is. Making it non-blocking
+    // would turn every dial into an EINPROGRESS state machine for no benefit here.
     set_nonblock(fd);
   }
   return fd;
@@ -226,14 +264,21 @@ static void start_tunnel(struct conn *c, int ufd, const char *reply, const char 
   struct conn *u = conn_new(ufd);
   if (!u) { close(ufd); fail(c, "500 Internal Server Error"); return; }
 
-  if (arm(c) < 0 || arm(u) < 0) { conn_close(u); fail(c, "500 Internal Server Error"); return; }
+  if (arm(c) < 0 || arm(u) < 0) {
+    // arm(c) may have succeeded, leaving c in ST_TUNNEL with its header buffer freed but
+    // no peer. Say so explicitly rather than relying on the field still holding -1.
+    c->peer = -1;
+    conn_close(u);
+    fail(c, "500 Internal Server Error");
+    return;
+  }
   c->peer = ufd;
   u->peer = c->fd;
 
-  if (reply) (void)!write(c->fd, reply, strlen(reply));
+  if (reply && !write_all(c->fd, reply, strlen(reply))) { conn_close(c); return; }
   // Anything the client already sent past the header goes upstream before we start
   // splicing, or it would be lost.
-  if (head_len > 0) (void)!write(ufd, head, (size_t)head_len);
+  if (head_len > 0 && !write_all(ufd, head, (size_t)head_len)) { conn_close(c); return; }
 
   struct epoll_event ev = {0};
   ev.events = EPOLLIN | EPOLLRDHUP;
@@ -259,10 +304,28 @@ static void do_connect(struct conn *c, char *target, char *head, int head_len) {
 
 // Plain HTTP (the absolute-URI form a proxy receives). In practice everything Claude Code
 // talks to is HTTPS, so this path is close to dead -- but a proxy that silently fails on
-// port 80 is a bad proxy. We rewrite the request line to origin form and forward the
-// header block untouched, then splice the rest like any other tunnel. No response parsing:
-// whatever the server sends goes straight back, including its framing.
-static void do_http(struct conn *c, char *method, char *url, char *rest, int rest_len) {
+// port 80 is a bad proxy.
+//
+// We rewrite the request line to origin form, drop the hop-by-hop headers that are
+// addressed to us rather than to the server, and add `Connection: close`. That last part
+// matters: the response is spliced back without parsing its framing, so this connection
+// carries exactly one request. Announcing that is honest, and it stops a keep-alive
+// client from pipelining a second request into a tunnel already bound to the first
+// request's upstream. RFC 9110 calls these headers connection-specific for the same
+// reason -- they must not be forwarded.
+static int hop_by_hop(const char *line, size_t len) {
+  static const char *drop[] = {
+    "connection:", "proxy-connection:", "proxy-authorization:", "proxy-authenticate:",
+    "keep-alive:", "te:", "trailer:", "transfer-encoding:", "upgrade:", NULL
+  };
+  for (int i = 0; drop[i]; i++) {
+    size_t n = strlen(drop[i]);
+    if (len >= n && strncasecmp(line, drop[i], n) == 0) return 1;
+  }
+  return 0;
+}
+static void do_http(struct conn *c, char *method, char *url, char *hdrs, int hdrs_len,
+                    char *body, int body_len) {
   if (strncasecmp(url, "http://", 7) != 0) { fail(c, "400 Bad Request"); return; }
   char *hostpart = url + 7;
   char *slash = strchr(hostpart, '/');
@@ -274,6 +337,10 @@ static void do_http(struct conn *c, char *method, char *url, char *rest, int res
   if (at) hostpart = at + 1;
 
   char host[256];
+  // host and port are copied out of c->req rather than pointed into it. The buffer
+  // outlives this function today (arm() frees it later, inside start_tunnel), but that
+  // is an ordering accident, and a stack copy costs nothing.
+  char portbuf[32];
   const char *port = "80";
   // A bracketed IPv6 literal contains colons that are not the port separator.
   if (*hostpart == '[') {
@@ -283,10 +350,19 @@ static void do_http(struct conn *c, char *method, char *url, char *rest, int res
     if (n >= sizeof host) { fail(c, "400 Bad Request"); return; }
     memcpy(host, hostpart + 1, n);
     host[n] = 0;
-    if (end[1] == ':') port = end + 2;
+    if (end[1] == ':') {
+      if (strlen(end + 2) >= sizeof portbuf) { fail(c, "400 Bad Request"); return; }
+      strcpy(portbuf, end + 2);
+      port = portbuf;
+    }
   } else {
     char *colon = strrchr(hostpart, ':');
-    if (colon) { *colon = 0; port = colon + 1; }
+    if (colon) {
+      *colon = 0;
+      if (strlen(colon + 1) >= sizeof portbuf) { fail(c, "400 Bad Request"); return; }
+      strcpy(portbuf, colon + 1);
+      port = portbuf;
+    }
     if (strlen(hostpart) >= sizeof host) { fail(c, "400 Bad Request"); return; }
     strcpy(host, hostpart);
   }
@@ -296,12 +372,31 @@ static void do_http(struct conn *c, char *method, char *url, char *rest, int res
   int ufd = dial(host, port);
   if (ufd < 0) { fail(c, "502 Bad Gateway"); return; }
 
-  // Rebuild the request line in origin form, then hand over the original headers.
+  // Rebuild the request line in origin form.
   char line[1024];
   int n = snprintf(line, sizeof line, "%s %s HTTP/1.1\r\n", method, path);
   if (n < 0 || n >= (int)sizeof line) { close(ufd); fail(c, "400 Bad Request"); return; }
-  (void)!write(ufd, line, (size_t)n);
-  start_tunnel(c, ufd, NULL, rest, rest_len);
+  if (!write_all(ufd, line, (size_t)n)) { close(ufd); fail(c, "502 Bad Gateway"); return; }
+
+  // Then the client's headers, minus the ones meant for us.
+  char *q = hdrs;
+  char *stop = hdrs + hdrs_len;
+  while (q < stop) {
+    char *nl = memchr(q, '\n', (size_t)(stop - q));
+    size_t llen = nl ? (size_t)(nl - q + 1) : (size_t)(stop - q);
+    if (!hop_by_hop(q, llen) && !write_all(ufd, q, llen)) {
+      close(ufd);
+      fail(c, "502 Bad Gateway");
+      return;
+    }
+    q += llen;
+  }
+  if (!write_all(ufd, "Connection: close\r\n\r\n", 21)) {
+    close(ufd);
+    fail(c, "502 Bad Gateway");
+    return;
+  }
+  start_tunnel(c, ufd, NULL, body, body_len);
 }
 
 // Parse what we have so far. Returns 1 if the connection is still alive.
@@ -344,14 +439,13 @@ static int on_header(struct conn *c) {
   if (strcmp(method, "CONNECT") == 0) {
     do_connect(c, url, body, body_len);
   } else {
-    // Everything after the request line, still in its original form.
+    // Everything after the request line. The header block is still NUL-terminated at
+    // `end`; the body (if any) sits past the separator and is forwarded untouched.
     char *hdrs = strchr(sp2 + 1, '\n');
     hdrs = hdrs ? hdrs + 1 : end;
-    // The header block and the body are contiguous in the buffer; forward both. We
-    // restore the separator we nulled so the upstream sees a well-formed request.
-    memcpy(end, sep == 4 ? "\r\n\r\n" : "\n\n", (size_t)sep);
-    int len = c->req_len - (int)(hdrs - c->req);
-    do_http(c, method, url, hdrs, len);
+    char *body2 = end + sep;
+    int body2_len = c->req_len - (int)(body2 - c->req);
+    do_http(c, method, url, hdrs, (int)(end - hdrs), body2, body2_len);
   }
   return 1;
 }
@@ -463,6 +557,13 @@ int main(void) {
           if (kill(started_under, 0) != 0 && errno == ESRCH) _exit(0);
           if (getppid() != started_under) _exit(0);
         }
+        // Same tick: drop connections that opened and then never sent a request.
+        time_t now = time(NULL);
+        for (int f = 0; f < MAX_FDS; f++) {
+          struct conn *s = conns[f];
+          if (s && s->state == ST_HEADER && now - s->born >= HEADER_TIMEOUT)
+            conn_close(s);
+        }
         continue;
       }
 
@@ -478,8 +579,13 @@ int main(void) {
       // Tunnel. EPOLLOUT means our peer's pipe can move again, so pump that side.
       if (e & EPOLLOUT) {
         struct conn *p = conn_get(c->peer);
-        if (p && !pump(p)) { conn_close(p); continue; }
-        if (!conn_get(fd)) continue; // closing the peer may have closed us
+        if (p && !pump(p)) conn_close(p);
+        // conn_close(p) cascades: it can close us too, freeing c. Re-fetch rather than
+        // trusting the pointer we still hold. pump() itself never closes anything, so
+        // this is the only place in the loop where c can die underneath us -- which is
+        // exactly why the check belongs here and not inside the branch above.
+        c = conn_get(fd);
+        if (!c) continue;
       }
       if (e & (EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP)) {
         if (!pump(c)) { conn_close(c); continue; }

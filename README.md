@@ -39,7 +39,9 @@ same official binary runs directly on bionic.
 
 - Termux on aarch64
 - `curl`, `tar`, `patchelf` (installed automatically if missing)
-- `bun` — strongly recommended (`pkg install bun`); `node` works but starts ~9× slower
+- A DNS proxy, which is one of:
+  - `clang` (`pkg install clang`) — builds the C proxy: ~3MB resident, one thread. Preferred.
+  - `bun` (`pkg install bun`) or `node` — runs the JS fallback instead (~25–45MB resident)
 - ~250MB of storage, ~95MB of download
 - A Claude Pro, Max, Team, Enterprise or Console account
 
@@ -76,8 +78,19 @@ path. Under a loader-based launcher those shims exec the loader and die with
 
 **2. DNS.** musl resolves through `/etc/resolv.conf`, which Android doesn't have — DNS
 inside the process *hangs* rather than failing. Only a bionic process can ask Android for
-resolvers, so `dns-proxy.js` runs on bun (or node) and the binary tunnels through it via
+resolvers, so a small proxy runs on the bionic side and the binary tunnels through it via
 `HTTPS_PROXY`. The proxy is loopback-only, starts with the session and exits with it.
+
+There are two of them, with the same contract — print a port on stdout, serve until the
+wrapper is gone. `dns-proxy.c` is preferred: a single-threaded `epoll` + `splice(2)` tunnel
+that never copies payload bytes into userspace. `dns-proxy.js` is the fallback for installs
+without a compiler. Measured on the same workload (8 concurrent requests plus a 5MB
+transfer), the C proxy holds ~2.8MB resident against bun's ~45MB, 656KB of private dirty
+against 11.2MB, and one thread against four — the JS runtime spends about a quarter of its
+CPU on allocator upkeep for a process whose real work is moving bytes between two sockets.
+
+`install.sh` builds the C proxy when `cc` is present and falls back quietly when it isn't.
+`CLAUDE_MUSL_RUNTIME=bun` (or `node`) forces the JS path for a session.
 
 **3. `LD_PRELOAD`.** Termux preloads `libtermux-exec-ld-preload.so`, a *bionic* library
 that a musl process cannot relocate — it fails on `__register_atfork`, `__errno` and the

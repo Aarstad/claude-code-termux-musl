@@ -35,12 +35,22 @@ cleanup() { [ -n "${PROXY_PID:-}" ] && kill "$PROXY_PID" 2>/dev/null; return 0; 
 trap cleanup EXIT INT TERM
 
 if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
-  # Either runtime runs the proxy unchanged, but bun boots in ~30ms against node's
-  # ~290ms on this device, and that cost is paid on every launch. Both are bionic
-  # builds, which is the part that matters: only bionic can ask Android for a resolver.
+  # The C proxy is the default: same contract, same stdout line, but ~2.8MB RSS against
+  # bun's ~45MB and one thread against four. The JS version stays beside it as the
+  # fallback, so a toolchain-less install (or a bad build) still works.
+  #
+  # CLAUDE_MUSL_RUNTIME=bun|node forces the JS path.
   RUNTIME="${CLAUDE_MUSL_RUNTIME:-}"
-  [ -n "$RUNTIME" ] || { command -v bun >/dev/null 2>&1 && RUNTIME=bun || RUNTIME=node; }
-  command -v "$RUNTIME" >/dev/null 2>&1 || die "need bun or node for the DNS proxy (pkg install bun)"
+  if [ -z "$RUNTIME" ] && [ -x "$LIBEXEC/dns-proxy" ]; then
+    PROXY_CMD=("$LIBEXEC/dns-proxy")
+  else
+    # Either runtime runs the proxy unchanged, but bun boots in ~30ms against node's
+    # ~290ms on this device, and that cost is paid on every launch. Both are bionic
+    # builds, which is the part that matters: only bionic can ask Android for a resolver.
+    [ -n "$RUNTIME" ] || { command -v bun >/dev/null 2>&1 && RUNTIME=bun || RUNTIME=node; }
+    command -v "$RUNTIME" >/dev/null 2>&1 || die "need bun or node for the DNS proxy (pkg install bun)"
+    PROXY_CMD=("$RUNTIME" "$LIBEXEC/dns-proxy.js")
+  fi
 
   # A coprocess rather than a fifo: it needs no mkfifo binary, and bash hands back both
   # the pipe and the pid. Reading one line blocks until the proxy reports its port.
@@ -50,7 +60,7 @@ if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
   # the proxy survives, reparented, until something else reaps it. With exec the pid is
   # the proxy itself. (Bash marks these fds close-on-exec, so the claude child below never
   # inherits them.)
-  coproc DNSPROXY { exec "$RUNTIME" "$LIBEXEC/dns-proxy.js"; }
+  coproc DNSPROXY { exec "${PROXY_CMD[@]}"; }
   PROXY_PID="${DNSPROXY_PID:-}"
   PORT=""
   if [ -n "${DNSPROXY[0]:-}" ]; then

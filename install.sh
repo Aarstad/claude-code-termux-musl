@@ -44,12 +44,25 @@ if ! command -v patchelf >/dev/null; then
   pkg install -y patchelf >/dev/null || die "could not install patchelf"
 fi
 
-if command -v bun >/dev/null; then
-  say "proxy runtime: bun $(bun --version)"
-elif command -v node >/dev/null; then
-  say "proxy runtime: node $(node --version) — bun is ~9x faster to start (pkg install bun)"
+# The proxy is either the C binary (built below, if there is a compiler) or the JS
+# fallback on bun/node. At least one has to be available, but neither is required on its
+# own: clang is a ~190MB dependency and bun/node may simply not be installed.
+HAVE_CC=0
+command -v cc >/dev/null 2>&1 && HAVE_CC=1
+HAVE_JS=0
+command -v bun >/dev/null 2>&1 && HAVE_JS=1
+command -v node >/dev/null 2>&1 && HAVE_JS=1
+
+if [ "$HAVE_CC" = 0 ] && [ "$HAVE_JS" = 0 ]; then
+  die "need a compiler or a JS runtime for the DNS proxy (pkg install clang, or pkg install bun)"
+fi
+
+if [ "$HAVE_CC" = 1 ]; then
+  say "proxy: building the C proxy (~3MB resident, one thread)"
+elif command -v bun >/dev/null; then
+  say "proxy runtime: bun $(bun --version) — install clang for the C proxy (~15x less memory)"
 else
-  die "need bun or node for the DNS proxy (pkg install bun)"
+  say "proxy runtime: node $(node --version) — install clang for the C proxy (~15x less memory)"
 fi
 
 # --- musl loader -------------------------------------------------------------
@@ -80,7 +93,27 @@ mkdir -p "$LIBEXEC"
 install -m 755 "$HERE/bin/claude-musl"        "$PREFIX/bin/claude-musl"
 install -m 755 "$HERE/bin/claude-musl-update" "$PREFIX/bin/claude-musl-update"
 install -m 644 "$HERE/libexec/dns-proxy.js"   "$LIBEXEC/dns-proxy.js"
+install -m 644 "$HERE/libexec/dns-proxy.c"    "$LIBEXEC/dns-proxy.c"
 [ -f "$HERE/README.md" ] && install -m 644 "$HERE/README.md" "$LIBEXEC/README.md"
+
+# The C proxy is preferred at runtime; the JS one stays as the fallback, so a failed
+# build is a downgrade rather than a broken install. Both are always installed.
+# A stale binary from an earlier install must not outlive a build we are not doing:
+# the wrapper prefers whatever is executable here.
+rm -f "$LIBEXEC/dns-proxy"
+if [ "$HAVE_CC" = 1 ]; then
+  if cc -O2 -o "$LIBEXEC/dns-proxy" "$HERE/libexec/dns-proxy.c" 2>/dev/null; then
+    chmod 755 "$LIBEXEC/dns-proxy"
+    say "built the C proxy ($(du -k "$LIBEXEC/dns-proxy" | cut -f1)KB)"
+  else
+    rm -f "$LIBEXEC/dns-proxy"
+    if [ "$HAVE_JS" = 1 ]; then
+      say "the C proxy did not build; using the JS fallback"
+    else
+      die "the C proxy did not build and there is no JS runtime to fall back to"
+    fi
+  fi
+fi
 
 # --- the binary --------------------------------------------------------------
 # One code path for install and update: the updater fetches, checks the npm

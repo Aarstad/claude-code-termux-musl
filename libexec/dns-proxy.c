@@ -1,4 +1,4 @@
-// A tiny HTTP/CONNECT proxy so the musl build of Claude Code can reach the network.
+// A tiny HTTP/CONNECT proxy so musl CLI builds can reach the network.
 //
 // musl resolves names through /etc/resolv.conf, which Android does not have, so DNS
 // inside the musl process is dead (it times out rather than failing fast). This binary
@@ -7,13 +7,10 @@
 //
 // Prints its port on stdout, then serves until the process that started it is gone.
 //
-// This is the C replacement for the bun/node dns-proxy.js. Same contract, same stdout
-// line, same lifecycle. It exists because the JS version drags an entire JavaScript
-// runtime (JSC, mimalloc, a GC thread pool, an 18GB address space) into a process whose
-// real work is copying bytes between two sockets: ~21MB RSS and 9.7MB of private dirty
-// pages per session, of which a quarter of all CPU ever burned went to the allocator's
-// background scavenger. This does the same job in one thread with no allocator to speak
-// of and no garbage to collect.
+// This is the C replacement for dns-proxy.js. It avoids a JavaScript runtime per
+// session and uses one event-loop thread. Tunnel data travels through kernel pipes;
+// headers and connection metadata are the main userspace allocations. Socket and
+// pipe buffers still cost kernel memory, which process RSS does not include.
 //
 //   cc -O2 -o dns-proxy dns-proxy.c
 //
@@ -43,13 +40,20 @@
 // headers. A client that connects and then says nothing otherwise holds a slot and a
 // 16KB buffer forever; the watchdog timer is already ticking, so the sweep is free.
 #define HEADER_TIMEOUT 30
+// Shared across resolved addresses; DNS itself still uses bionic's timeout.
+#ifndef CONNECT_TIMEOUT_MS
+#define CONNECT_TIMEOUT_MS 5000
+#endif
+#ifndef WRITE_TIMEOUT_MS
+#define WRITE_TIMEOUT_MS 5000
+#endif
 // Pipe capacity for splice(). 64K matches the default Linux pipe size; asking for more
 // needs privileges we do not have.
 #define PIPE_CAP 65536
 // The connection table is indexed by fd, so this is an fd ceiling, not a connection
 // ceiling. A tunnel costs six fds: a socket and a pipe pair on each side. With the four
 // fixed fds (epoll, stdin, timerfd, listener) that is roughly 85 concurrent tunnels
-// before accept() starts refusing. Sized for one Claude Code session, which opens a
+// before accepted sockets may be rejected. Sized for one CLI session, which opens a
 // handful; raising it is a one-line change if that ever stops being true.
 #define MAX_FDS 512
 
@@ -67,7 +71,7 @@ struct conn {
   int want_out;       // peer's socket buffer was full; we are waiting for it to drain
   char *req;          // header buffer, allocated only while state == ST_HEADER
   int req_len;
-  time_t born;        // for the ST_HEADER idle sweep; unused once tunnelled
+  int64_t born;        // for the ST_HEADER idle sweep; unused once tunnelled
 };
 
 static struct conn *conns[MAX_FDS];
@@ -80,20 +84,39 @@ static void set_nonblock(int fd) {
   if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK);
 }
 
+static int64_t monotonic_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int wait_writable(int fd, int64_t deadline) {
+  for (;;) {
+    int64_t remaining = deadline - monotonic_ms();
+    if (remaining <= 0) { errno = ETIMEDOUT; return 0; }
+    struct pollfd pf = { .fd = fd, .events = POLLOUT };
+    int rc = poll(&pf, 1, (int)remaining);
+    if (rc > 0) return !(pf.revents & POLLNVAL);
+    if (rc == 0) { errno = ETIMEDOUT; return 0; }
+    if (errno != EINTR) return 0;
+  }
+}
+
 // A short write on a non-blocking socket is not an error, it is a partial send -- and
 // dropping the remainder corrupts the stream with no diagnostic. These writes happen
 // before the connection is spliced, so blocking briefly here is safe and simpler than
 // carrying a pending-write buffer. Returns 0 if the peer is gone.
 static int write_all(int fd, const char *buf, size_t len) {
   size_t off = 0;
+  int64_t deadline = monotonic_ms() + WRITE_TIMEOUT_MS;
   while (off < len) {
+    if (monotonic_ms() >= deadline) { errno = ETIMEDOUT; return 0; }
     ssize_t w = write(fd, buf + off, len - off);
     if (w > 0) { off += (size_t)w; continue; }
     if (w < 0 && errno == EINTR) continue;
     if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       // Wait for room rather than spinning; this is a handful of bytes at setup time.
-      struct pollfd pf = { .fd = fd, .events = POLLOUT };
-      if (poll(&pf, 1, 5000) <= 0) return 0;
+      if (!wait_writable(fd, deadline)) return 0;
       continue;
     }
     return 0;
@@ -114,13 +137,13 @@ static struct conn *conn_new(int fd) {
   c->peer = -1;
   c->pipe_r = c->pipe_w = -1;
   c->state = ST_HEADER;
-  c->born = time(NULL);
+  c->born = monotonic_ms();
   conns[fd] = c;
   return c;
 }
 
-// Tear down one side. The peer is detached first so it can finish draining whatever is
-// already in its pipe; it closes itself once that is done.
+// A fatal close ends both directions: buffered peer bytes have no destination.
+// Orderly half-closes are handled by pump() before reaching this function.
 static void conn_close(struct conn *c) {
   if (!c) return;
   int fd = c->fd;
@@ -133,27 +156,24 @@ static void conn_close(struct conn *c) {
   close(fd);
   conns[fd] = NULL;
   free(c);
-  // The peer has nothing left to write into: finish it too, once its pipe is empty.
-  if (p && p->inflight == 0) conn_close(p);
-  else if (p) p->fd_eof = 1;
+  if (p) conn_close(p);
+}
+
+static void ep_update(struct conn *c) {
+  struct conn *p = conn_get(c->peer);
+  struct epoll_event ev = {0};
+  ev.data.fd = c->fd;
+  // Pause reads and half-close notifications while our pipe is blocked.
+  // Level-triggered epoll reports remaining data/EOF when reads resume.
+  if (!c->fd_eof && !c->want_out) ev.events |= EPOLLIN | EPOLLRDHUP;
+  if (p && p->want_out) ev.events |= EPOLLOUT;
+  epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
 }
 
 static void ep_mod(struct conn *c) {
-  struct epoll_event ev = {0};
-  ev.data.fd = c->fd;
-  ev.events = EPOLLIN | EPOLLRDHUP;
-  if (c->fd_eof) ev.events &= ~EPOLLIN; // nothing more will arrive
-  // If our peer's socket is backed up we must hear about it becoming writable. That
-  // event belongs to the peer's fd, not ours.
+  ep_update(c);
   struct conn *p = conn_get(c->peer);
-  if (p && c->want_out) {
-    struct epoll_event pv = {0};
-    pv.data.fd = p->fd;
-    pv.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
-    if (p->fd_eof) pv.events &= ~EPOLLIN;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, p->fd, &pv);
-  }
-  epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+  if (p) ep_update(p);
 }
 
 // ---- the tunnel ----------------------------------------------------------------------
@@ -182,6 +202,7 @@ static int pump(struct conn *c) {
         ep_mod(c);
         return 1;
       }
+      if (w < 0 && errno == EINTR) continue;
       return 0; // EPIPE or similar: peer is gone
     }
     if (c->want_out) { c->want_out = 0; ep_mod(c); }
@@ -212,36 +233,36 @@ static void fail(struct conn *c, const char *status) {
   conn_close(c);
 }
 
-// Resolve and connect, blocking. Measured on this device: 4-32ms warm, ~121ms worst case
-// for a name that does not resolve. That is a real stall of the event loop, but it is
-// bounded and rare -- bionic fails fast rather than timing out, which is the entire
-// reason this proxy exists. Making it async would mean either threads (the overhead we
-// are removing) or a hand-written resolver (hundreds of lines reimplementing what Android
-// already gets right, including reading nameservers from system properties). Neither is
-// worth it for a proxy serving one client.
+// DNS remains synchronous through bionic. TCP attempts share a finite deadline,
+// rather than waiting for kernel TCP timeouts. Other tunnels still pause during
+// setup; this is not asynchronous DNS/connect.
 static int dial(const char *host, const char *port) {
   struct addrinfo hints, *res, *ai;
   memset(&hints, 0, sizeof hints);
-  hints.ai_family = AF_UNSPEC; // v4 or v6, whichever the network offers
+  hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
 
   int fd = -1;
-  for (ai = res; ai; ai = ai->ai_next) {
-    fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+  int64_t deadline = monotonic_ms() + CONNECT_TIMEOUT_MS;
+  for (ai = res; ai && monotonic_ms() < deadline; ai = ai->ai_next) {
+    fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                ai->ai_protocol);
     if (fd < 0) continue;
-    if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+    int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+    if (rc == 0) break;
+    if (errno == EINPROGRESS && wait_writable(fd, deadline)) {
+      int error = 0;
+      socklen_t len = sizeof error;
+      if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) break;
+    }
     close(fd);
     fd = -1;
   }
   freeaddrinfo(res);
   if (fd >= 0) {
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); // it is a tunnel; do not batch
-    // Non-blocking is set *after* connect(), on purpose: the connect above is meant to be
-    // synchronous, for the same reason the resolve above it is. Making it non-blocking
-    // would turn every dial into an EINPROGRESS state machine for no benefit here.
-    set_nonblock(fd);
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
   }
   return fd;
 }
@@ -254,8 +275,6 @@ static int arm(struct conn *c) {
   c->pipe_r = pfd[0];
   c->pipe_w = pfd[1];
   c->state = ST_TUNNEL;
-  free(c->req);
-  c->req = NULL;
   return 0;
 }
 
@@ -265,7 +284,7 @@ static void start_tunnel(struct conn *c, int ufd, const char *reply, const char 
   if (!u) { close(ufd); fail(c, "500 Internal Server Error"); return; }
 
   if (arm(c) < 0 || arm(u) < 0) {
-    // arm(c) may have succeeded, leaving c in ST_TUNNEL with its header buffer freed but
+    // arm(c) may have succeeded, leaving c in ST_TUNNEL but
     // no peer. Say so explicitly rather than relying on the field still holding -1.
     c->peer = -1;
     conn_close(u);
@@ -279,6 +298,10 @@ static void start_tunnel(struct conn *c, int ufd, const char *reply, const char 
   // Anything the client already sent past the header goes upstream before we start
   // splicing, or it would be lost.
   if (head_len > 0 && !write_all(ufd, head, (size_t)head_len)) { conn_close(c); return; }
+
+  // head points into the request buffer; retain it until forwarding completes.
+  free(c->req);
+  c->req = NULL;
 
   struct epoll_event ev = {0};
   ev.events = EPOLLIN | EPOLLRDHUP;
@@ -302,16 +325,14 @@ static void do_connect(struct conn *c, char *target, char *head, int head_len) {
   start_tunnel(c, ufd, "HTTP/1.1 200 Connection Established\r\n\r\n", head, head_len);
 }
 
-// Plain HTTP (the absolute-URI form a proxy receives). In practice everything Claude Code
-// talks to is HTTPS, so this path is close to dead -- but a proxy that silently fails on
-// port 80 is a bad proxy.
+// Plain HTTP (the absolute-URI form a proxy receives). The main CLI traffic uses
+// HTTPS, but ordinary fixed-length HTTP requests are supported too.
 //
 // We rewrite the request line to origin form, drop the hop-by-hop headers that are
 // addressed to us rather than to the server, and add `Connection: close`. That last part
 // matters: the response is spliced back without parsing its framing, so this connection
-// carries exactly one request. Announcing that is honest, and it stops a keep-alive
-// client from pipelining a second request into a tunnel already bound to the first
-// request's upstream. RFC 9110 calls these headers connection-specific for the same
+// asks the origin to close after its response. This is not a framing parser and
+// does not enforce one request against clients that ignore Connection: close. RFC 9110 calls these headers connection-specific for the same
 // reason -- they must not be forwarded.
 static int hop_by_hop(const char *line, size_t len) {
   static const char *drop[] = {
@@ -326,6 +347,17 @@ static int hop_by_hop(const char *line, size_t len) {
 }
 static void do_http(struct conn *c, char *method, char *url, char *hdrs, int hdrs_len,
                     char *body, int body_len) {
+  // Chunked bodies are not decoded here. Reject rather than removing framing
+  // and forwarding ambiguous bytes. CONNECT tunnels are unaffected.
+  for (char *q = hdrs, *stop = hdrs + hdrs_len; q < stop;) {
+    char *nl = memchr(q, '\n', (size_t)(stop - q));
+    size_t len = nl ? (size_t)(nl - q + 1) : (size_t)(stop - q);
+    if (len >= 18 && strncasecmp(q, "transfer-encoding:", 18) == 0) {
+      fail(c, "501 Not Implemented");
+      return;
+    }
+    q += len;
+  }
   if (strncasecmp(url, "http://", 7) != 0) { fail(c, "400 Bad Request"); return; }
   char *hostpart = url + 7;
   char *slash = strchr(hostpart, '/');
@@ -338,7 +370,7 @@ static void do_http(struct conn *c, char *method, char *url, char *hdrs, int hdr
 
   char host[256];
   // host and port are copied out of c->req rather than pointed into it. The buffer
-  // outlives this function today (arm() frees it later, inside start_tunnel), but that
+  // outlives this function today (start_tunnel frees it after forwarding), but that
   // is an ordering accident, and a stack copy costs nothing.
   char portbuf[32];
   const char *port = "80";
@@ -385,6 +417,12 @@ static void do_http(struct conn *c, char *method, char *url, char *hdrs, int hdr
     char *nl = memchr(q, '\n', (size_t)(stop - q));
     size_t llen = nl ? (size_t)(nl - q + 1) : (size_t)(stop - q);
     if (!hop_by_hop(q, llen) && !write_all(ufd, q, llen)) {
+      close(ufd);
+      fail(c, "502 Bad Gateway");
+      return;
+    }
+    // The parser excludes the separator, including the final header newline.
+    if (!nl && !hop_by_hop(q, llen) && !write_all(ufd, "\r\n", 2)) {
       close(ufd);
       fail(c, "502 Bad Gateway");
       return;
@@ -558,10 +596,10 @@ int main(void) {
           if (getppid() != started_under) _exit(0);
         }
         // Same tick: drop connections that opened and then never sent a request.
-        time_t now = time(NULL);
+        int64_t now = monotonic_ms();
         for (int f = 0; f < MAX_FDS; f++) {
           struct conn *s = conns[f];
-          if (s && s->state == ST_HEADER && now - s->born >= HEADER_TIMEOUT)
+          if (s && s->state == ST_HEADER && now - s->born >= HEADER_TIMEOUT * 1000)
             conn_close(s);
         }
         continue;

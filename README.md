@@ -134,11 +134,15 @@ version instead — all published versions are a ~7s re-fetch away.
   `/usr/bin/env`. The glibc launcher behaves the same way.
 - If search ever misbehaves, Anthropic's Alpine guidance is to set `USE_BUILTIN_RIPGREP=0`
   and install system ripgrep (`pkg install ripgrep`).
-- Long sessions and background tasks work: this README's own updates were written from a
-  multi-hour `claude-musl` session that spawned background jobs and had them report back.
-  Subagents and MCP servers remain untested here, though the sibling
-  [agy-termux-musl](https://github.com/Aarstad/agy-termux-musl) exercises both on the same
-  musl + DNS-proxy stack, so the machinery underneath them is known to work.
+- **Long sessions, background tasks, subagents and MCP servers all work.** This README's
+  own updates came out of a multi-hour `claude-musl` session that spawned background jobs
+  and subagents and had them report back. A local stdio MCP server (bun, over JSON-RPC)
+  connects and is spawned as a child process, and the remote `claude.ai` servers — Docs,
+  Drive, Gmail, Calendar — connect over HTTPS through the DNS proxy.
+- One thing that does not work, and is not musl's doing: **MCP tools are not propagated
+  into subagents.** A subagent finds no `mcp__*` entries in its toolset at all. Tools bind
+  at session start, so a server registered mid-session is not picked up either. Both are
+  Claude Code harness behaviours and would apply on any platform.
 
 ## Uninstall
 

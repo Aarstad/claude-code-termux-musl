@@ -134,7 +134,11 @@ version instead — all published versions are a ~7s re-fetch away.
   `/usr/bin/env`. The glibc launcher behaves the same way.
 - If search ever misbehaves, Anthropic's Alpine guidance is to set `USE_BUILTIN_RIPGREP=0`
   and install system ripgrep (`pkg install ripgrep`).
-- Untested: long sessions under load, subagents, background tasks, MCP servers.
+- Long sessions and background tasks work: this README's own updates were written from a
+  multi-hour `claude-musl` session that spawned background jobs and had them report back.
+  Subagents and MCP servers remain untested here, though the sibling
+  [agy-termux-musl](https://github.com/Aarstad/agy-termux-musl) exercises both on the same
+  musl + DNS-proxy stack, so the machinery underneath them is known to work.
 
 ## Uninstall
 
@@ -144,6 +148,19 @@ version instead — all published versions are a ~7s re-fetch away.
 ```
 
 `~/.claude` — settings, credentials, session history — is never touched.
+
+## Related
+
+The same musl approach works for other AI CLIs on Android:
+
+- **[agy-termux-musl](https://github.com/Aarstad/agy-termux-musl)** — Google's Antigravity
+  CLI. Harder: its glibc-only binary needs 24 bytes of patches to fix two hard-coded glibc
+  layout assumptions, plus a symbol shim and a CA-bundle path. Reuses this repo's musl
+  loader and `dns-proxy.c`.
+- **OpenAI's Codex CLI** needs none of this — it ships a *statically linked*
+  `aarch64-unknown-linux-musl` build that bionic runs as-is. Take the GitHub release
+  asset, not the npm package: `@openai/codex` declares no musl dependency, so `npm i -g`
+  fetches a glibc binary that cannot run.
 
 ## Credits
 

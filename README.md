@@ -157,10 +157,10 @@ The same musl approach works for other AI CLIs on Android:
   CLI. Harder: its glibc-only binary needs 24 bytes of patches to fix two hard-coded glibc
   layout assumptions, plus a symbol shim and a CA-bundle path. Reuses this repo's musl
   loader and `dns-proxy.c`.
-- **OpenAI's Codex CLI** needs none of this — it ships a *statically linked*
-  `aarch64-unknown-linux-musl` build that bionic runs as-is. Take the GitHub release
-  asset, not the npm package: `@openai/codex` declares no musl dependency, so `npm i -g`
-  fetches a glibc binary that cannot run.
+- **OpenAI's Codex CLI** needs none of this: its `aarch64-unknown-linux-musl` release is
+  fully static — no `PT_INTERP`, no `DT_NEEDED`, so no loader is involved at all. Take the
+  GitHub release asset rather than npm, though: `@openai/codex` declares no musl
+  dependency, so `npm i -g` fetches a glibc build that cannot run here.
 
 ## Credits
 

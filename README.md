@@ -79,10 +79,20 @@ path. Under a loader-based launcher those shims exec the loader and die with
 **2. DNS.** musl resolves through `/etc/resolv.conf`, which Android doesn't have — DNS
 inside the process *hangs* rather than failing. Only a bionic process can ask Android for
 resolvers, so a small proxy runs on the bionic side and the binary tunnels through it via
-`HTTPS_PROXY`. The proxy is loopback-only, starts with the session and exits with it.
+`HTTPS_PROXY`.
 
-There are two of them, with the same contract — print a port on stdout, serve until the
-wrapper is gone. `dns-proxy.c` is preferred: a single-threaded `epoll` + `splice(2)` tunnel
+The proxy supports two modes:
+- **Shared Daemon Mode (`termux-dns-proxy`)**: Runs once as a background service listening on
+  `127.0.0.1:18080`. All sessions across `claude-musl`, `agy`, and `codex` automatically detect
+  and share this single instance, eliminating process spawning overhead and leaks. Manage it with:
+  ```bash
+  termux-dns-proxy {start|stop|restart|status}
+  ```
+- **Ad-hoc Per-Session Mode (Fallback)**: If the shared daemon isn't running, the launcher
+  automatically starts a transient companion proxy on a dynamic port that exits when the session ends.
+
+There are two proxy implementations:
+`dns-proxy.c` is preferred: a single-threaded `epoll` + `splice(2)` tunnel
 that never copies payload bytes into userspace. `dns-proxy.js` is the fallback for installs
 without a compiler. Measured on the same workload (8 concurrent requests plus a 5MB
 transfer), the C proxy holds ~2.8MB resident against bun's ~45MB, 656KB of private dirty

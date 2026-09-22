@@ -151,16 +151,12 @@ version instead — all published versions are a ~7s re-fetch away.
 
 ## Related
 
-The same musl approach works for other AI CLIs on Android:
+Same approach, other AI CLIs on Android:
 
-- **[agy-termux-musl](https://github.com/Aarstad/agy-termux-musl)** — Google's Antigravity
-  CLI. Harder: its glibc-only binary needs 24 bytes of patches to fix two hard-coded glibc
-  layout assumptions, plus a symbol shim and a CA-bundle path. Reuses this repo's musl
-  loader and `dns-proxy.c`.
-- **OpenAI's Codex CLI** needs none of this: its `aarch64-unknown-linux-musl` release is
-  fully static — no `PT_INTERP`, no `DT_NEEDED`, so no loader is involved at all. Take the
-  GitHub release asset rather than npm, though: `@openai/codex` declares no musl
-  dependency, so `npm i -g` fetches a glibc build that cannot run here.
+- **[agy-termux-musl](https://github.com/Aarstad/agy-termux-musl)** — Google's Antigravity CLI
+- **[codex-termux](https://github.com/Aarstad/codex-termux)** — OpenAI's Codex CLI
+
+Both reuse this repo's `dns-proxy.c`.
 
 ## Credits
 

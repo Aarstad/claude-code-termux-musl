@@ -88,6 +88,17 @@ The proxy supports two modes:
   ```bash
   termux-dns-proxy {start|stop|restart|status}
   ```
+  To have it supervised and started with Termux (and at device boot, if Termux:Boot is
+  installed), run it under termux-services instead: `dns-proxy -f 18080` stays in the
+  foreground for runit.
+  ```bash
+  pkg install termux-services
+  mkdir -p $PREFIX/var/service/dns-proxy/log
+  printf '#!/data/data/com.termux/files/usr/bin/sh\nexec 2>&1\nexec %s/libexec/claude-musl/dns-proxy -f 18080\n' "$PREFIX" > $PREFIX/var/service/dns-proxy/run
+  chmod 755 $PREFIX/var/service/dns-proxy/run
+  ln -sf $PREFIX/share/termux-services/svlogger $PREFIX/var/service/dns-proxy/log/run
+  sv-enable dns-proxy
+  ```
 - **Ad-hoc Per-Session Mode (Fallback)**: If the shared daemon isn't running, the launcher
   automatically starts a transient companion proxy on a dynamic port that exits when the session ends.
 

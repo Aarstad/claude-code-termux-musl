@@ -485,8 +485,12 @@ int main(int argc, char **argv) {
 
   int fixed_port = 0;
   int daemon_mode = 0;
+  int foreground = 0; // -f: fixed port but stay attached, for a supervisor such as runit
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-d") == 0) {
+      daemon_mode = 1;
+    } else if (strcmp(argv[i], "-f") == 0) {
+      foreground = 1;
       daemon_mode = 1;
     } else {
       int p = atoi(argv[i]);
@@ -497,7 +501,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (daemon_mode) {
+  if (daemon_mode && !foreground) {
     if (daemon(1, 0) < 0) return 1;
   }
 

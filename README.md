@@ -10,8 +10,8 @@ Nothing here reimplements or repackages Claude Code: `install.sh` fetches Anthro
 published binary from npm, verifies its `sha512`, and changes exactly one field in its ELF
 header — the interpreter path. Logging in works as it does on any supported platform.
 
-(Timings and sizes throughout are measured on one device — a Snapdragon-class Android
-phone running Termux. Your numbers will differ; the ratios should not.)
+(Timings and sizes throughout are measured on one device — a $200 phone, the Honor 600
+Lite, running Termux. Your numbers will differ; the ratios should not.)
 
 ```
 $ claude-musl --version

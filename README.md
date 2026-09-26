@@ -94,13 +94,20 @@ The proxy supports two modes:
   ```bash
   pkg install termux-services
   mkdir -p $PREFIX/var/service/dns-proxy/log
-  printf '#!/data/data/com.termux/files/usr/bin/sh\nexec 2>&1\nexec %s/libexec/claude-musl/dns-proxy -f 18080\n' "$PREFIX" > $PREFIX/var/service/dns-proxy/run
+  printf '#!/data/data/com.termux/files/usr/bin/sh\nexec 2>&1\nmkdir -p %s/.config/termux-http-proxy && chmod 700 %s/.config/termux-http-proxy\nexec %s/libexec/claude-musl/dns-proxy -f 18080 --auth-file %s/.config/termux-http-proxy/token\n' "$HOME" "$HOME" "$PREFIX" "$HOME" > $PREFIX/var/service/dns-proxy/run
   chmod 755 $PREFIX/var/service/dns-proxy/run
   ln -sf $PREFIX/share/termux-services/svlogger $PREFIX/var/service/dns-proxy/log/run
   sv-enable dns-proxy
   ```
+  `--auth-file` makes the daemon require a token, because any app on the device can
+  reach `127.0.0.1:18080` and would otherwise have an open relay. It creates the token
+  (random, mode 0600) on first start; `claude-musl`, `agy` and `codex` read it from
+  `~/.config/termux-http-proxy/token` (or `$TERMUX_PROXY_TOKEN_FILE`) and put it in the
+  proxy URL. Sessions started before the daemon required a token keep a URL without
+  one, so restart them after enabling it.
 - **Ad-hoc Per-Session Mode (Fallback)**: If the shared daemon isn't running, the launcher
-  automatically starts a transient companion proxy on a dynamic port that exits when the session ends.
+  automatically starts a transient companion proxy on a dynamic port that exits when the session ends,
+  with the same token.
 
 There are two proxy implementations:
 `dns-proxy.c` is preferred: a single-threaded `epoll` + `splice(2)` tunnel

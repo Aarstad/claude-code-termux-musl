@@ -12,6 +12,7 @@
 # so we start a small proxy on the bionic side and point the binary at it.
 #
 #   CLAUDE_MUSL_NO_PROXY=1   use the ambient proxy settings instead of starting one
+#   TERMUX_PROXY_TOKEN_FILE  proxy token (default ~/.config/termux-http-proxy/token)
 #
 set -uo pipefail
 
@@ -28,6 +29,21 @@ export DISABLE_AUTOUPDATER=1
 
 die() { echo "claude-musl: $*" >&2; exit 1; }
 
+# The proxy can require a token (--auth-file): Android's loopback is reachable by every
+# app on the device, so without one any app could use it as an open relay. The token
+# lives where only Termux can read it. Credentials sent to a proxy that does not ask
+# for them are ignored, so this works whether or not the shared daemon requires them.
+PROXY_TOKEN_FILE="${TERMUX_PROXY_TOKEN_FILE:-$HOME/.config/termux-http-proxy/token}"
+proxy_url() {
+  local token=""
+  [ -r "$PROXY_TOKEN_FILE" ] && token="$(tr -d '[:space:]' < "$PROXY_TOKEN_FILE")"
+  if [ -n "$token" ]; then
+    printf 'http://proxy:%s@127.0.0.1:%s' "$token" "$1"
+  else
+    printf 'http://127.0.0.1:%s' "$1"
+  fi
+}
+
 PROXY_PID=""
 # Not named PROXY, because `coproc PROXY` would make bash own a variable of this name
 # and unset it when the coprocess is reaped — taking our snapshot with it.
@@ -40,7 +56,7 @@ if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
     export CLAUDE_CODE_PROXY_RESOLVES_HOSTS=true
   # If a shared daemon is already active on localhost:18080, reuse it without spawning a process.
   elif nc -z 127.0.0.1 18080 2>/dev/null; then
-    export http_proxy="http://127.0.0.1:18080"
+    export http_proxy="$(proxy_url 18080)"
     export https_proxy="$http_proxy"
     export HTTP_PROXY="$http_proxy"
     export HTTPS_PROXY="$http_proxy"
@@ -54,7 +70,9 @@ if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
     # CLAUDE_MUSL_RUNTIME=bun|node forces the JS path.
     RUNTIME="${CLAUDE_MUSL_RUNTIME:-}"
     if [ -z "$RUNTIME" ] && [ -x "$LIBEXEC/dns-proxy" ]; then
-      PROXY_CMD=("$LIBEXEC/dns-proxy")
+      # Creates the token (random, 0600) on first use; the JS fallback has no --auth-file.
+      mkdir -p "${PROXY_TOKEN_FILE%/*}" && chmod 700 "${PROXY_TOKEN_FILE%/*}"
+      PROXY_CMD=("$LIBEXEC/dns-proxy" --auth-file "$PROXY_TOKEN_FILE")
     else
       [ -n "$RUNTIME" ] || { command -v bun >/dev/null 2>&1 && RUNTIME=bun || RUNTIME=node; }
       command -v "$RUNTIME" >/dev/null 2>&1 || die "need bun or node for the DNS proxy (pkg install bun)"
@@ -71,7 +89,11 @@ if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
     fi
 
     if [ -n "$PORT" ]; then
-      export http_proxy="http://127.0.0.1:$PORT"
+      if [ "${PROXY_CMD[0]}" = "$LIBEXEC/dns-proxy" ]; then
+        export http_proxy="$(proxy_url "$PORT")"
+      else
+        export http_proxy="http://127.0.0.1:$PORT"
+      fi
       export https_proxy="$http_proxy"
       export HTTP_PROXY="$http_proxy"
       export HTTPS_PROXY="$http_proxy"

@@ -104,7 +104,10 @@ The proxy supports two modes:
 
 There are two proxy implementations:
 `dns-proxy.c` is preferred: a single-threaded `epoll` + `splice(2)` tunnel
-that never copies payload bytes into userspace. `dns-proxy.js` is the fallback for installs
+that never copies payload bytes into userspace. It resolves names with Android's
+asynchronous resolver, so one slow lookup does not stall the other tunnels, and
+`--auth-file PATH` makes it require a token — worth it for the shared daemon, since
+any app on the device can reach loopback. `dns-proxy.js` is the fallback for installs
 without a compiler. Measured on the same workload (8 concurrent requests plus a 5MB
 transfer), the C proxy holds ~2.8MB resident against bun's ~45MB, 656KB of private dirty
 against 11.2MB, and one thread against four — the JS runtime spends about a quarter of its

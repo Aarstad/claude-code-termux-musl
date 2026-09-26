@@ -9,7 +9,8 @@
 # (723KB) — so /proc/self/exe is the binary itself and those work again.
 #
 # DNS still needs help: musl reads /etc/resolv.conf, which Android does not have,
-# so we start a small proxy on the bionic side and point the binary at it.
+# so we start a small proxy on the bionic side (termux-http-proxy) and point the
+# binary at it.
 #
 #   CLAUDE_MUSL_NO_PROXY=1   use the ambient proxy settings instead of starting one
 #   TERMUX_PROXY_TOKEN_FILE  proxy token (default ~/.config/termux-http-proxy/token)
@@ -69,27 +70,27 @@ if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
     #
     # CLAUDE_MUSL_RUNTIME=bun|node forces the JS path.
     RUNTIME="${CLAUDE_MUSL_RUNTIME:-}"
-    if [ -z "$RUNTIME" ] && [ -x "$LIBEXEC/dns-proxy" ]; then
+    if [ -z "$RUNTIME" ] && [ -x "$LIBEXEC/termux-http-proxy" ]; then
       # Creates the token (random, 0600) on first use; the JS fallback has no --auth-file.
       mkdir -p "${PROXY_TOKEN_FILE%/*}" && chmod 700 "${PROXY_TOKEN_FILE%/*}"
-      PROXY_CMD=("$LIBEXEC/dns-proxy" --auth-file "$PROXY_TOKEN_FILE")
+      PROXY_CMD=("$LIBEXEC/termux-http-proxy" --auth-file "$PROXY_TOKEN_FILE")
     else
       [ -n "$RUNTIME" ] || { command -v bun >/dev/null 2>&1 && RUNTIME=bun || RUNTIME=node; }
-      command -v "$RUNTIME" >/dev/null 2>&1 || die "need bun or node for the DNS proxy (pkg install bun)"
-      PROXY_CMD=("$RUNTIME" "$LIBEXEC/dns-proxy.js")
+      command -v "$RUNTIME" >/dev/null 2>&1 || die "need bun or node for the proxy (pkg install bun)"
+      PROXY_CMD=("$RUNTIME" "$LIBEXEC/termux-http-proxy.js")
     fi
 
     # A coprocess rather than a fifo: it needs no mkfifo binary, and bash hands back both
     # the pipe and the pid. Reading one line blocks until the proxy reports its port.
-    coproc DNSPROXY { exec "${PROXY_CMD[@]}"; }
-    PROXY_PID="${DNSPROXY_PID:-}"
+    coproc HTTPPROXY { exec "${PROXY_CMD[@]}"; }
+    PROXY_PID="${HTTPPROXY_PID:-}"
     PORT=""
-    if [ -n "${DNSPROXY[0]:-}" ]; then
-      read -r -t 15 PORT <&"${DNSPROXY[0]}" || true
+    if [ -n "${HTTPPROXY[0]:-}" ]; then
+      read -r -t 15 PORT <&"${HTTPPROXY[0]}" || true
     fi
 
     if [ -n "$PORT" ]; then
-      if [ "${PROXY_CMD[0]}" = "$LIBEXEC/dns-proxy" ]; then
+      if [ "${PROXY_CMD[0]}" = "$LIBEXEC/termux-http-proxy" ]; then
         export http_proxy="$(proxy_url "$PORT")"
       else
         export http_proxy="http://127.0.0.1:$PORT"
@@ -101,7 +102,7 @@ if [ -z "${CLAUDE_MUSL_NO_PROXY:-}" ]; then
       export CLAUDE_CODE_PROXY_RESOLVES_HOSTS=true
     else
       cleanup; PROXY_PID=""
-      die "the DNS proxy did not start; set CLAUDE_MUSL_NO_PROXY=1 to run without it anyway"
+      die "the proxy did not start; set CLAUDE_MUSL_NO_PROXY=1 to run without it anyway"
     fi
   fi
 fi

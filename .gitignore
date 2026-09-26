@@ -2,4 +2,4 @@
 *.tgz
 claude
 claude.prev
-/libexec/dns-proxy
+/libexec/termux-http-proxy

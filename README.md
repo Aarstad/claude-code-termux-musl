@@ -39,7 +39,7 @@ same official binary runs directly on bionic.
 
 - Termux on aarch64
 - `curl`, `tar`, `patchelf` (installed automatically if missing)
-- A DNS proxy, which is one of:
+- A proxy for DNS (`termux-http-proxy`), which is one of:
   - `clang` (`pkg install clang`) — builds the C proxy: ~3MB resident, one thread. Preferred.
   - `bun` (`pkg install bun`) or `node` — runs the JS fallback instead (~25–45MB resident)
 - ~250MB of storage, ~95MB of download
@@ -82,23 +82,22 @@ resolvers, so a small proxy runs on the bionic side and the binary tunnels throu
 `HTTPS_PROXY`.
 
 The proxy supports two modes:
-- **Shared Daemon Mode (`termux-dns-proxy`)**: Runs once as a background service listening on
-  `127.0.0.1:18080`. All sessions across `claude-musl`, `agy`, and `codex` automatically detect
-  and share this single instance, eliminating process spawning overhead and leaks. Manage it with:
-  ```bash
-  termux-dns-proxy {start|stop|restart|status}
-  ```
-  To have it supervised and started with Termux (and at device boot, if Termux:Boot is
-  installed), run it under termux-services instead: `dns-proxy -f 18080` stays in the
-  foreground for runit.
+- **Shared Daemon Mode**: Runs once as a background service listening on `127.0.0.1:18080`.
+  All sessions across `claude-musl`, `agy`, and `codex` automatically detect and share this
+  single instance, eliminating process spawning overhead and leaks. Run it under
+  termux-services to have it supervised and started with Termux (and at device boot, if
+  Termux:Boot is installed): `termux-http-proxy -f 18080` stays in the foreground for runit.
   ```bash
   pkg install termux-services
-  mkdir -p $PREFIX/var/service/dns-proxy/log
-  printf '#!/data/data/com.termux/files/usr/bin/sh\nexec 2>&1\nmkdir -p %s/.config/termux-http-proxy && chmod 700 %s/.config/termux-http-proxy\nexec %s/libexec/claude-musl/dns-proxy -f 18080 --auth-file %s/.config/termux-http-proxy/token\n' "$HOME" "$HOME" "$PREFIX" "$HOME" > $PREFIX/var/service/dns-proxy/run
-  chmod 755 $PREFIX/var/service/dns-proxy/run
-  ln -sf $PREFIX/share/termux-services/svlogger $PREFIX/var/service/dns-proxy/log/run
-  sv-enable dns-proxy
+  mkdir -p $PREFIX/var/service/termux-http-proxy/log
+  printf '#!/data/data/com.termux/files/usr/bin/sh\nexec 2>&1\nmkdir -p %s/.config/termux-http-proxy && chmod 700 %s/.config/termux-http-proxy\nexec %s/libexec/claude-musl/termux-http-proxy -f 18080 --auth-file %s/.config/termux-http-proxy/token\n' "$HOME" "$HOME" "$PREFIX" "$HOME" > $PREFIX/var/service/termux-http-proxy/run
+  chmod 755 $PREFIX/var/service/termux-http-proxy/run
+  ln -sf $PREFIX/share/termux-services/svlogger $PREFIX/var/service/termux-http-proxy/log/run
+  sv-enable termux-http-proxy
   ```
+  Then `sv {up|down|restart|status} $PREFIX/var/service/termux-http-proxy` manages it.
+  The proxy used to be called `dns-proxy`; `install.sh` leaves a `dns-proxy` symlink in
+  `$PREFIX/libexec/claude-musl`, so a service set up under the old name keeps running.
   `--auth-file` makes the daemon require a token, because any app on the device can
   reach `127.0.0.1:18080` and would otherwise have an open relay. It creates the token
   (random, mode 0600) on first start; `claude-musl`, `agy` and `codex` read it from
@@ -110,11 +109,11 @@ The proxy supports two modes:
   with the same token.
 
 There are two proxy implementations:
-`dns-proxy.c` is preferred: a single-threaded `epoll` + `splice(2)` tunnel
+`termux-http-proxy.c` is preferred: a single-threaded `epoll` + `splice(2)` tunnel
 that never copies payload bytes into userspace. It resolves names with Android's
 asynchronous resolver, so one slow lookup does not stall the other tunnels, and
 `--auth-file PATH` makes it require a token — worth it for the shared daemon, since
-any app on the device can reach loopback. `dns-proxy.js` is the fallback for installs
+any app on the device can reach loopback. `termux-http-proxy.js` is the fallback for installs
 without a compiler. Measured on the same workload (8 concurrent requests plus a 5MB
 transfer), the C proxy holds ~2.8MB resident against bun's ~45MB, 656KB of private dirty
 against 11.2MB, and one thread against four — the JS runtime spends about a quarter of its
@@ -169,7 +168,7 @@ version instead — all published versions are a ~7s re-fetch away.
   own updates came out of a multi-hour `claude-musl` session that spawned background jobs
   and subagents and had them report back. A local stdio MCP server (bun, over JSON-RPC)
   connects and is spawned as a child process, and the remote `claude.ai` servers — Docs,
-  Drive, Gmail, Calendar — connect over HTTPS through the DNS proxy.
+  Drive, Gmail, Calendar — connect over HTTPS through the proxy.
 
 ## Uninstall
 
@@ -187,7 +186,7 @@ Same approach, other AI CLIs on Android:
 - **[agy-termux-musl](https://github.com/Aarstad/agy-termux-musl)** — Google's Antigravity CLI
 - **[codex-termux](https://github.com/Aarstad/codex-termux)** — OpenAI's Codex CLI
 
-Both reuse this repo's `dns-proxy.c`.
+Both reuse this repo's `termux-http-proxy.c`.
 
 ## Credits
 

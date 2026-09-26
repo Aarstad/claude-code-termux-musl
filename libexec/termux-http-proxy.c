@@ -28,7 +28,7 @@
 // (Proxy-Authorization: Basic, any username) before it resolves or dials anything.
 //
 // Compilation:
-//   cc -O2 -o dns-proxy dns-proxy.c
+//   cc -O2 -o termux-http-proxy termux-http-proxy.c
 //
 // Built entirely on standard Linux/Bionic interfaces without third-party dependencies.
 

@@ -54,7 +54,7 @@ command -v bun >/dev/null 2>&1 && HAVE_JS=1
 command -v node >/dev/null 2>&1 && HAVE_JS=1
 
 if [ "$HAVE_CC" = 0 ] && [ "$HAVE_JS" = 0 ]; then
-  die "need a compiler or a JS runtime for the DNS proxy (pkg install clang, or pkg install bun)"
+  die "need a compiler or a JS runtime for the proxy (pkg install clang, or pkg install bun)"
 fi
 
 if [ "$HAVE_CC" = 1 ]; then
@@ -92,21 +92,25 @@ say "installing wrapper, updater and proxy"
 mkdir -p "$LIBEXEC"
 install -m 755 "$HERE/bin/claude-musl"        "$PREFIX/bin/claude-musl"
 install -m 755 "$HERE/bin/claude-musl-update" "$PREFIX/bin/claude-musl-update"
-install -m 644 "$HERE/libexec/dns-proxy.js"   "$LIBEXEC/dns-proxy.js"
-install -m 644 "$HERE/libexec/dns-proxy.c"    "$LIBEXEC/dns-proxy.c"
+install -m 644 "$HERE/libexec/termux-http-proxy.js" "$LIBEXEC/termux-http-proxy.js"
+install -m 644 "$HERE/libexec/termux-http-proxy.c"  "$LIBEXEC/termux-http-proxy.c"
+# The proxy used to be called dns-proxy; its sources from an earlier install go.
+rm -f "$LIBEXEC/dns-proxy.js" "$LIBEXEC/dns-proxy.c"
 [ -f "$HERE/README.md" ] && install -m 644 "$HERE/README.md" "$LIBEXEC/README.md"
 
 # The C proxy is preferred at runtime; the JS one stays as the fallback, so a failed
 # build is a downgrade rather than a broken install. Both are always installed.
 # A stale binary from an earlier install must not outlive a build we are not doing:
 # the wrapper prefers whatever is executable here.
-rm -f "$LIBEXEC/dns-proxy"
+rm -f "$LIBEXEC/termux-http-proxy" "$LIBEXEC/dns-proxy"
 if [ "$HAVE_CC" = 1 ]; then
-  if cc -O2 -o "$LIBEXEC/dns-proxy" "$HERE/libexec/dns-proxy.c" 2>/dev/null; then
-    chmod 755 "$LIBEXEC/dns-proxy"
-    say "built the C proxy ($(du -k "$LIBEXEC/dns-proxy" | cut -f1)KB)"
+  if cc -O2 -o "$LIBEXEC/termux-http-proxy" "$HERE/libexec/termux-http-proxy.c" 2>/dev/null; then
+    chmod 755 "$LIBEXEC/termux-http-proxy"
+    # A runit service set up before the rename runs $LIBEXEC/dns-proxy; keep it working.
+    ln -sf termux-http-proxy "$LIBEXEC/dns-proxy"
+    say "built the C proxy ($(du -k "$LIBEXEC/termux-http-proxy" | cut -f1)KB)"
   else
-    rm -f "$LIBEXEC/dns-proxy"
+    rm -f "$LIBEXEC/termux-http-proxy"
     if [ "$HAVE_JS" = 1 ]; then
       say "the C proxy did not build; using the JS fallback"
     else

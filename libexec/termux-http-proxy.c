@@ -36,8 +36,10 @@
 // resolves or dials anything.
 //
 // Deny list:
-// --deny-file names domains to refuse, each with its subdomains, before anything is
-// resolved or dialed. SIGHUP rereads it (sv hup), so it can be edited live.
+// --deny-file (repeatable: the user's own list, blocklists) names domains to refuse,
+// each with its subdomains, before anything is resolved or dialed. Plain domain lists,
+// hosts files and AdBlock "||domain^" rules are understood; "@@" entries allow a domain
+// whatever the lists say. SIGHUP rereads them all (sv hup), so they can change live.
 //
 // Logging:
 // --log writes one line per connection: protocol, target, the username the client
@@ -1080,61 +1082,204 @@ static int load_token(const char *path) {
 
 // ---- Deny list -----------------------------------------------------------------------
 
-static char *deny_list;      // The file's domains, lowercased, each NUL-terminated
-static size_t deny_size;
-static const char *deny_path;
+// Domains to refuse, from --deny-file: the user's own list and blocklists, which run to
+// hundreds of thousands of names. Each is kept once in a hash table, so a lookup checks
+// only the host's own suffixes (a.b.example.com, b.example.com, example.com, com).
+#define MAX_DENY_FILES 32
+#define DENY_ALLOW 0x80000000u // Slot flag: an allow ("@@") entry, which beats any deny
+
+struct denyset {
+  char *names;     // Every domain, lowercased, NUL-terminated, back to back
+  size_t len, cap;
+  uint32_t *slots; // Open addressing: 1 + offset into names (| DENY_ALLOW), 0 = empty
+  size_t nslots;   // A power of two, at least twice the entries
+  uint32_t denies, allows;
+};
+
+static struct denyset deny;
+static const char *deny_paths[MAX_DENY_FILES];
+static int ndeny_paths;
 static volatile sig_atomic_t deny_reload; // Set by SIGHUP
 static sigset_t wait_mask;                // Signal mask while waiting: SIGHUP unblocked
 
-// Reads the deny list: one domain per line, "#" starts a comment, and a leading "*."
-// or "." is optional since subdomains always match. Replaces the current list only on
-// success. Returns the number of domains, or -1 after printing why.
-static int load_deny(const char *path) {
+static int deny_on(void) {
+  return deny.nslots != 0;
+}
+
+static uint32_t name_hash(const char *s) {
+  uint32_t h = 2166136261u; // FNV-1a
+  while (*s) h = (h ^ (uint8_t)*s++) * 16777619u;
+  return h;
+}
+
+// The slot holding name, or the empty slot where it would go.
+static size_t deny_slot(const struct denyset *d, const char *name) {
+  size_t mask = d->nslots - 1, i = name_hash(name) & mask;
+  while (d->slots[i] && strcmp(d->names + ((d->slots[i] & ~DENY_ALLOW) - 1), name) != 0)
+    i = (i + 1) & mask;
+  return i;
+}
+
+static int deny_grow(struct denyset *d) {
+  size_t n = d->nslots ? d->nslots * 2 : 1024;
+  uint32_t *old = d->slots;
+  size_t oldn = d->nslots;
+  if (!(d->slots = calloc(n, sizeof *d->slots))) { d->slots = old; return -1; }
+  d->nslots = n;
+  for (size_t i = 0; i < oldn; i++) {
+    if (!old[i]) continue;
+    d->slots[deny_slot(d, d->names + ((old[i] & ~DENY_ALLOW) - 1))] = old[i];
+  }
+  free(old);
+  return 0;
+}
+
+// Adds a domain (lowercase, valid). An allow entry marks it allowed even if also denied.
+static int deny_add(struct denyset *d, const char *name, size_t len, int allow) {
+  if ((d->denies + d->allows + 1) * 2 > d->nslots && deny_grow(d) < 0) return -1;
+  size_t i = deny_slot(d, name);
+  if (d->slots[i]) {
+    if (allow && !(d->slots[i] & DENY_ALLOW)) { d->slots[i] |= DENY_ALLOW; d->allows++; d->denies--; }
+    return 0;
+  }
+  if (d->len + len + 1 > d->cap) {
+    size_t cap = d->cap ? d->cap * 2 : 65536;
+    while (cap < d->len + len + 1) cap *= 2;
+    if (cap > DENY_ALLOW) return -1; // Offsets must leave the flag bit free
+    char *grown = realloc(d->names, cap);
+    if (!grown) return -1;
+    d->names = grown;
+    d->cap = cap;
+  }
+  memcpy(d->names + d->len, name, len + 1);
+  d->slots[i] = (uint32_t)(d->len + 1) | (allow ? DENY_ALLOW : 0);
+  d->len += len + 1;
+  if (allow) d->allows++;
+  else d->denies++;
+  return 0;
+}
+
+static void deny_free(struct denyset *d) {
+  free(d->names);
+  free(d->slots);
+  memset(d, 0, sizeof *d);
+}
+
+// An IPv4 or IPv6 address, as a hosts file starts its lines with.
+static int is_address(const char *s) {
+  uint8_t buf[16];
+  return inet_pton(AF_INET, s, buf) == 1 || inet_pton(AF_INET6, s, buf) == 1;
+}
+
+// Normalises a domain in place (lowercase; no leading "*." or ".", no trailing ".").
+// Returns its length, or 0 if it is not a plain domain name (URL paths, wildcards
+// in the middle, addresses).
+static size_t clean_domain(char **pd) {
+  char *d = *pd;
+  if (d[0] == '*' && d[1] == '.') d += 2;
+  while (*d == '.') d++;
+  size_t len = strlen(d);
+  while (len > 0 && d[len - 1] == '.') d[--len] = 0;
+  if (!len || len > 253 || is_address(d)) return 0;
+  for (size_t i = 0; i < len; i++) {
+    unsigned char ch = (unsigned char)(d[i] = (char)tolower((unsigned char)d[i]));
+    if (!(ch >= 'a' && ch <= 'z') && !(ch >= '0' && ch <= '9') && ch != '.' && ch != '-' && ch != '_')
+      return 0;
+  }
+  *pd = d;
+  return len;
+}
+
+// Reads one file into d. Understands plain domain lists, hosts files ("0.0.0.0 name"),
+// and AdBlock-style "||name^" rules; "@@" in front makes an allow entry. Comments start
+// with "#" (or "!" and "[" at the start of a line, as in AdBlock lists). Rules with
+// options ("$...") or paths are skipped: they are not about whole domains.
+static int deny_read(struct denyset *d, const char *path) {
   FILE *f = fopen(path, "re");
   if (!f) {
     fprintf(stderr, "termux-http-proxy: cannot open %s: %s\n", path, strerror(errno));
     return -1;
   }
-  char *list = NULL, line[512];
-  size_t size = 0;
-  int count = 0;
+  char line[1024];
   while (fgets(line, sizeof line, f)) {
-    char *hash = strchr(line, '#');
+    char *l = line;
+    while (*l == ' ' || *l == '\t') l++;
+    if (*l == '!' || *l == '[') continue;
+    // AdBlock element hiding ("example.com##.banner", "#@#", "#?#", ...) is about page
+    // content, not whole domains: cutting it at "#" would block all of example.com.
+    if (strstr(l, "##") || strstr(l, "#@#") || strstr(l, "#?#") || strstr(l, "#$#") ||
+        strstr(l, "#%#"))
+      continue;
+    char *hash = strchr(l, '#');
     if (hash) *hash = 0;
-    char *d = line;
-    while (*d == ' ' || *d == '\t') d++;
-    size_t len = strcspn(d, " \t\r\n");
-    d[len] = 0;
-    if (d[0] == '*' && d[1] == '.') { d += 2; len -= 2; }
-    while (*d == '.') { d++; len--; }
-    while (len > 0 && d[len - 1] == '.') d[--len] = 0;
-    if (!len) continue;
-    char *grown = realloc(list, size + len + 1);
-    if (!grown) { free(list); fclose(f); fprintf(stderr, "termux-http-proxy: out of memory\n"); return -1; }
-    list = grown;
-    for (size_t i = 0; i <= len; i++) list[size + i] = (char)tolower((unsigned char)d[i]);
-    size += len + 1;
-    count++;
+    l[strcspn(l, "\r\n")] = 0;
+    int allow = 0;
+    if (l[0] == '@' && l[1] == '@') { allow = 1; l += 2; }
+    if (l[0] == '|' && l[1] == '|') {
+      l += 2;
+      char *caret = strchr(l, '^');
+      if (caret) {
+        if (caret[1] && caret[1] != ' ' && caret[1] != '\t') continue; // "^$third-party" etc.
+        *caret = 0;
+      } else if (strpbrk(l, "$/")) {
+        continue;
+      }
+    }
+    char *save = NULL;
+    char *tok = strtok_r(l, " \t", &save);
+    if (!tok) continue;
+    char *next = strtok_r(NULL, " \t", &save);
+    if (next && is_address(tok)) { // hosts file: every name after the address
+      for (tok = next; tok; tok = strtok_r(NULL, " \t", &save)) {
+        char *name = tok;
+        size_t n = clean_domain(&name);
+        // Skip the local names hosts files carry (localhost, broadcasthost, ...).
+        if (n && strchr(name, '.') && deny_add(d, name, n, allow) < 0) goto oom;
+      }
+      continue;
+    }
+    size_t n = clean_domain(&tok);
+    if (n && deny_add(d, tok, n, allow) < 0) goto oom;
   }
   fclose(f);
-  free(deny_list);
-  deny_list = list;
-  deny_size = size;
-  return count;
+  return 0;
+oom:
+  fclose(f);
+  fprintf(stderr, "termux-http-proxy: out of memory reading %s\n", path);
+  return -1;
 }
 
-// A host is denied if it is a listed domain or a subdomain of one.
-static int host_denied(const char *host) {
-  size_t hlen = strlen(host);
-  while (hlen > 0 && host[hlen - 1] == '.') hlen--; // "example.com." is example.com
-  for (size_t off = 0; off < deny_size;) {
-    const char *d = deny_list + off;
-    size_t dlen = strlen(d);
-    off += dlen + 1;
-    if (dlen > hlen || strncasecmp(host + hlen - dlen, d, dlen) != 0) continue;
-    if (dlen == hlen || host[hlen - dlen - 1] == '.') return 1;
+// Reads every --deny-file into a new set, which replaces the current one only if all of
+// them could be read. Returns the number of denied domains, or -1 after printing why.
+static int load_deny(void) {
+  struct denyset next = {0};
+  for (int i = 0; i < ndeny_paths; i++) {
+    if (deny_read(&next, deny_paths[i]) < 0) { deny_free(&next); return -1; }
   }
-  return 0;
+  if (!next.nslots && deny_grow(&next) < 0) return -1; // Empty, but on
+  deny_free(&deny);
+  deny = next;
+  return (int)deny.denies;
+}
+
+// A host is denied if it, or a domain it is under, is denied, and none of them is allowed.
+static int host_denied(const char *host) {
+  if (!deny_on()) return 0;
+  char buf[256];
+  size_t n = strlen(host);
+  while (n > 0 && host[n - 1] == '.') n--; // "example.com." is example.com
+  if (n == 0 || n >= sizeof buf) return 0;
+  for (size_t i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)host[i]);
+  buf[n] = 0;
+  int denied = 0;
+  for (const char *p = buf; p;) {
+    uint32_t v = deny.slots[deny_slot(&deny, p)];
+    if (v & DENY_ALLOW) return 0;
+    if (v) denied = 1;
+    p = strchr(p, '.');
+    if (p) p++;
+  }
+  return denied;
 }
 
 static void on_sighup(int sig) {
@@ -1290,7 +1435,7 @@ static void udp_expire(struct conn *c) {
 static int udp_dns(struct conn *c, const struct sockaddr_storage *dst, const uint8_t *q, int len) {
   char name[256];
   int qend = query_name(q, len, name, sizeof name);
-  if (qend > 0 && deny_size && host_denied(name)) {
+  if (qend > 0 && host_denied(name)) {
     uint8_t reply[12 + 260];
     memcpy(reply, q, (size_t)qend);
     reply[2] = (uint8_t)(0x80 | (q[2] & 0x79)); // QR, keeping the opcode and RD
@@ -1383,7 +1528,7 @@ static void udp_send(struct conn *c, const struct sockaddr_storage *dst, const u
 // that cannot get through over UDP falls back to TCP (QUIC does), which dials both.
 static void udp_to_name(struct conn *c, const char *host, uint16_t port, const uint8_t *data, int len) {
   struct udp_assoc *ua = c->ua;
-  if (deny_size && host_denied(host)) {
+  if (host_denied(host)) {
     for (int i = 0; i < UDP_NAMES; i++) {
       if (ua->names[i].logged_block && strcmp(ua->names[i].host, host) == 0) return;
     }
@@ -1724,7 +1869,7 @@ static int start_setup(struct conn *c) {
     snprintf(c->log->target, sizeof c->log->target, "%s%s%s:%u", v6 ? "[" : "", host,
              v6 ? "]" : "", c->su->port);
   }
-  if (deny_size && host_denied(c->su->host)) { refuse(c, E_BLOCKED, NULL); return 0; }
+  if (host_denied(c->su->host)) { refuse(c, E_BLOCKED, NULL); return 0; }
   // Until the tunnel exists, only errors and hangups matter on the client socket.
   struct epoll_event ev = {0};
   ev.data.fd = c->fd;
@@ -1941,8 +2086,9 @@ static void usage(void) {
           "                     (created with a random token, mode 0600, if missing)\n"
           "  --log PATH         append a line per connection to PATH (mode 0600);\n"
           "                     - writes to stderr without timestamps, for runit\n"
-          "  --deny-file PATH   refuse the domains in PATH (one per line, subdomains\n"
-          "                     included) before resolving; SIGHUP rereads it\n");
+          "  --deny-file PATH   refuse the domains in PATH, with their subdomains, before\n"
+          "                     resolving: domain lists, hosts files or AdBlock ||name^\n"
+          "                     rules; @@name allows. Repeatable; SIGHUP rereads them\n");
 }
 
 static int parse_port(const char *s) {
@@ -1972,7 +2118,8 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--auth-file") == 0 && i + 1 < argc) {
       auth_file = argv[++i];
     } else if (strcmp(argv[i], "--deny-file") == 0 && i + 1 < argc) {
-      deny_path = argv[++i];
+      if (ndeny_paths == MAX_DENY_FILES) { usage(); return 2; }
+      deny_paths[ndeny_paths++] = argv[++i];
     } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
       log_path = argv[++i];
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1989,8 +2136,8 @@ int main(int argc, char **argv) {
   // Before daemon(): a daemon's stderr is /dev/null, and a bad token file should be
   // reported, not silently turned into an unauthenticated proxy.
   if (auth_file && load_token(auth_file) < 0) return 1;
-  if (deny_path) {
-    if (load_deny(deny_path) < 0) return 1;
+  if (ndeny_paths) {
+    if (load_deny() < 0) return 1;
     // SIGHUP stays blocked except inside epoll_pwait, so it always interrupts the wait
     // (EINTR) instead of arriving mid-batch and waiting for the next event.
     struct sigaction sa = {0};
@@ -2079,13 +2226,15 @@ int main(int argc, char **argv) {
 
   struct epoll_event evs[64];
   for (;;) {
-    int n = epoll_pwait(epfd, evs, 64, next_timeout(), deny_path ? &wait_mask : NULL);
+    int n = epoll_pwait(epfd, evs, 64, next_timeout(), ndeny_paths ? &wait_mask : NULL);
     if (n < 0 && errno != EINTR) return 1;
     // After the errno check: a failed reread sets errno too.
     if (deny_reload) {
       deny_reload = 0;
-      int count = load_deny(deny_path); // Keeps the old list if the file is unreadable
-      if (count >= 0) fprintf(stderr, "termux-http-proxy: reread %s: %d domains\n", deny_path, count);
+      int count = load_deny(); // Keeps the old lists if one is unreadable
+      if (count >= 0)
+        fprintf(stderr, "termux-http-proxy: reread %d deny file%s: %d domains denied, %u allowed\n",
+                ndeny_paths, ndeny_paths == 1 ? "" : "s", count, deny.allows);
     }
     if (n < 0) continue;
     for (int i = 0; i < n; i++) {

@@ -33,6 +33,10 @@
 // (Proxy-Authorization: Basic, or SOCKS5's password, with any username) before it
 // resolves or dials anything.
 //
+// Deny list:
+// --deny-file names domains to refuse, each with its subdomains, before anything is
+// resolved or dialed. SIGHUP rereads it (sv hup), so it can be edited live.
+//
 // Logging:
 // --log writes one line per connection: protocol, target, the username the client
 // gave (so tools can name themselves), the address connected to, the outcome, bytes
@@ -45,6 +49,7 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -117,7 +122,7 @@ enum { SOCKS_GREETING, SOCKS_AUTH, SOCKS_REQUEST };
 // Why a connection could not be set up. Each maps to an HTTP status, a SOCKS5 reply
 // code and a name for the log (see refuse()).
 enum { E_BAD_REQUEST, E_AUTH, E_TOO_LARGE, E_UNSUPPORTED, E_ADDRESS_TYPE, E_INTERNAL,
-       E_NO_ADDRESS, E_UNREACHABLE, E_REFUSED, E_DNS_TIMEOUT, E_CONNECT_TIMEOUT };
+       E_NO_ADDRESS, E_UNREACHABLE, E_REFUSED, E_DNS_TIMEOUT, E_CONNECT_TIMEOUT, E_BLOCKED };
 
 // Everything needed to get from a parsed request to a connected upstream socket.
 // Allocated after the headers are parsed and freed once the tunnel starts, so an
@@ -600,13 +605,14 @@ static void refuse(struct conn *c, int err, const char *detail) {
     [E_REFUSED] = "502 Bad Gateway",
     [E_DNS_TIMEOUT] = "504 Gateway Timeout",
     [E_CONNECT_TIMEOUT] = "504 Gateway Timeout",
+    [E_BLOCKED] = "403 Forbidden",
   };
-  // RFC 1928: 1 general failure, 3 network unreachable, 4 host unreachable,
+  // RFC 1928: 1 general failure, 2 not allowed by ruleset, 3 network unreachable, 4 host unreachable,
   // 5 connection refused, 7 command not supported, 8 address type not supported.
   static const uint8_t socks[] = {
     [E_BAD_REQUEST] = 1, [E_AUTH] = 1, [E_TOO_LARGE] = 1, [E_UNSUPPORTED] = 7,
     [E_ADDRESS_TYPE] = 8, [E_INTERNAL] = 1, [E_NO_ADDRESS] = 4, [E_UNREACHABLE] = 4,
-    [E_REFUSED] = 5, [E_DNS_TIMEOUT] = 4, [E_CONNECT_TIMEOUT] = 4,
+    [E_REFUSED] = 5, [E_DNS_TIMEOUT] = 4, [E_CONNECT_TIMEOUT] = 4, [E_BLOCKED] = 2,
   };
   static const char *const names[] = {
     [E_BAD_REQUEST] = "bad-request", [E_AUTH] = "auth-failed",
@@ -614,7 +620,7 @@ static void refuse(struct conn *c, int err, const char *detail) {
     [E_ADDRESS_TYPE] = "unsupported-address-type", [E_INTERNAL] = "internal-error",
     [E_NO_ADDRESS] = "no-address", [E_UNREACHABLE] = "unreachable",
     [E_REFUSED] = "refused", [E_DNS_TIMEOUT] = "dns-timeout",
-    [E_CONNECT_TIMEOUT] = "connect-timeout",
+    [E_CONNECT_TIMEOUT] = "connect-timeout", [E_BLOCKED] = "blocked",
   };
   log_result(c, detail ? detail : names[err]);
   // Best effort notification prior to teardown
@@ -1018,6 +1024,70 @@ static int load_token(const char *path) {
   return 0;
 }
 
+// ---- Deny list -----------------------------------------------------------------------
+
+static char *deny_list;      // The file's domains, lowercased, each NUL-terminated
+static size_t deny_size;
+static const char *deny_path;
+static volatile sig_atomic_t deny_reload; // Set by SIGHUP
+static sigset_t wait_mask;                // Signal mask while waiting: SIGHUP unblocked
+
+// Reads the deny list: one domain per line, "#" starts a comment, and a leading "*."
+// or "." is optional since subdomains always match. Replaces the current list only on
+// success. Returns the number of domains, or -1 after printing why.
+static int load_deny(const char *path) {
+  FILE *f = fopen(path, "re");
+  if (!f) {
+    fprintf(stderr, "termux-http-proxy: cannot open %s: %s\n", path, strerror(errno));
+    return -1;
+  }
+  char *list = NULL, line[512];
+  size_t size = 0;
+  int count = 0;
+  while (fgets(line, sizeof line, f)) {
+    char *hash = strchr(line, '#');
+    if (hash) *hash = 0;
+    char *d = line;
+    while (*d == ' ' || *d == '\t') d++;
+    size_t len = strcspn(d, " \t\r\n");
+    d[len] = 0;
+    if (d[0] == '*' && d[1] == '.') { d += 2; len -= 2; }
+    while (*d == '.') { d++; len--; }
+    while (len > 0 && d[len - 1] == '.') d[--len] = 0;
+    if (!len) continue;
+    char *grown = realloc(list, size + len + 1);
+    if (!grown) { free(list); fclose(f); fprintf(stderr, "termux-http-proxy: out of memory\n"); return -1; }
+    list = grown;
+    for (size_t i = 0; i <= len; i++) list[size + i] = (char)tolower((unsigned char)d[i]);
+    size += len + 1;
+    count++;
+  }
+  fclose(f);
+  free(deny_list);
+  deny_list = list;
+  deny_size = size;
+  return count;
+}
+
+// A host is denied if it is a listed domain or a subdomain of one.
+static int host_denied(const char *host) {
+  size_t hlen = strlen(host);
+  while (hlen > 0 && host[hlen - 1] == '.') hlen--; // "example.com." is example.com
+  for (size_t off = 0; off < deny_size;) {
+    const char *d = deny_list + off;
+    size_t dlen = strlen(d);
+    off += dlen + 1;
+    if (dlen > hlen || strncasecmp(host + hlen - dlen, d, dlen) != 0) continue;
+    if (dlen == hlen || host[hlen - dlen - 1] == '.') return 1;
+  }
+  return 0;
+}
+
+static void on_sighup(int sig) {
+  (void)sig;
+  deny_reload = 1;
+}
+
 // ---- Request parsing -----------------------------------------------------------------
 
 // Splits "host", "host:port", "[v6]" or "[v6]:port" into its parts. Returns 0 on
@@ -1149,6 +1219,7 @@ static int start_setup(struct conn *c) {
     snprintf(c->log->target, sizeof c->log->target, "%s%s%s:%u", v6 ? "[" : "", host,
              v6 ? "]" : "", c->su->port);
   }
+  if (deny_size && host_denied(c->su->host)) { refuse(c, E_BLOCKED, NULL); return 0; }
   // Until the tunnel exists, only errors and hangups matter on the client socket.
   struct epoll_event ev = {0};
   ev.data.fd = c->fd;
@@ -1354,7 +1425,7 @@ static void expire_due(void) {
 static void usage(void) {
   fprintf(stderr,
           "usage: termux-http-proxy [--port PORT | PORT] [-f | -d] [--auth-file PATH]\n"
-          "                         [--log PATH]\n"
+          "                         [--log PATH] [--deny-file PATH]\n"
           "  (no port)          bind a free loopback port, print it, exit with the parent\n"
           "  --port PORT, PORT  bind PORT and detach as a daemon\n"
           "  -f                 with a port: stay in the foreground (for runit)\n"
@@ -1362,7 +1433,9 @@ static void usage(void) {
           "  --auth-file PATH   require Proxy-Authorization with the token in PATH\n"
           "                     (created with a random token, mode 0600, if missing)\n"
           "  --log PATH         append a line per connection to PATH (mode 0600);\n"
-          "                     - writes to stderr without timestamps, for runit\n");
+          "                     - writes to stderr without timestamps, for runit\n"
+          "  --deny-file PATH   refuse the domains in PATH (one per line, subdomains\n"
+          "                     included) before resolving; SIGHUP rereads it\n");
 }
 
 static int parse_port(const char *s) {
@@ -1391,6 +1464,8 @@ int main(int argc, char **argv) {
       daemon_mode = 1;
     } else if (strcmp(argv[i], "--auth-file") == 0 && i + 1 < argc) {
       auth_file = argv[++i];
+    } else if (strcmp(argv[i], "--deny-file") == 0 && i + 1 < argc) {
+      deny_path = argv[++i];
     } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
       log_path = argv[++i];
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1407,6 +1482,19 @@ int main(int argc, char **argv) {
   // Before daemon(): a daemon's stderr is /dev/null, and a bad token file should be
   // reported, not silently turned into an unauthenticated proxy.
   if (auth_file && load_token(auth_file) < 0) return 1;
+  if (deny_path) {
+    if (load_deny(deny_path) < 0) return 1;
+    // SIGHUP stays blocked except inside epoll_pwait, so it always interrupts the wait
+    // (EINTR) instead of arriving mid-batch and waiting for the next event.
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sighup;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGHUP, &sa, NULL);
+    sigset_t hup;
+    sigemptyset(&hup);
+    sigaddset(&hup, SIGHUP);
+    sigprocmask(SIG_BLOCK, &hup, &wait_mask);
+  }
   if (log_path && strcmp(log_path, "-") == 0) {
     if (daemon_mode && !foreground) {
       fprintf(stderr, "termux-http-proxy: --log - needs -f: a detached daemon has no stderr\n");
@@ -1484,11 +1572,15 @@ int main(int argc, char **argv) {
 
   struct epoll_event evs[64];
   for (;;) {
-    int n = epoll_wait(epfd, evs, 64, next_timeout());
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return 1;
+    int n = epoll_pwait(epfd, evs, 64, next_timeout(), deny_path ? &wait_mask : NULL);
+    if (n < 0 && errno != EINTR) return 1;
+    // After the errno check: a failed reread sets errno too.
+    if (deny_reload) {
+      deny_reload = 0;
+      int count = load_deny(deny_path); // Keeps the old list if the file is unreadable
+      if (count >= 0) fprintf(stderr, "termux-http-proxy: reread %s: %d domains\n", deny_path, count);
     }
+    if (n < 0) continue;
     for (int i = 0; i < n; i++) {
       int fd = evs[i].data.fd;
       uint32_t e = evs[i].events;

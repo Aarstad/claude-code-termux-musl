@@ -34,12 +34,13 @@ die() { echo "claude-musl: $*" >&2; exit 1; }
 # app on the device, so without one any app could use it as an open relay. The token
 # lives where only Termux can read it. Credentials sent to a proxy that does not ask
 # for them are ignored, so this works whether or not the shared daemon requires them.
+# The username is not checked; it names this tool in the proxy's connection log.
 PROXY_TOKEN_FILE="${TERMUX_PROXY_TOKEN_FILE:-$HOME/.config/termux-http-proxy/token}"
 proxy_url() {
   local token=""
   [ -r "$PROXY_TOKEN_FILE" ] && token="$(tr -d '[:space:]' < "$PROXY_TOKEN_FILE")"
   if [ -n "$token" ]; then
-    printf 'http://proxy:%s@127.0.0.1:%s' "$token" "$1"
+    printf 'http://claude:%s@127.0.0.1:%s' "$token" "$1"
   else
     printf 'http://127.0.0.1:%s' "$1"
   fi

@@ -1,4 +1,4 @@
-// High-performance, zero-copy HTTP/CONNECT proxy for Android/musl environments.
+// High-performance, zero-copy HTTP/CONNECT and SOCKS5 proxy for Android/musl environments.
 //
 // Background:
 // musl libc resolves names via /etc/resolv.conf, which Android environments lack.
@@ -11,6 +11,11 @@
 // Without a port, binds a dynamic loopback port, prints it to stdout and runs until
 // the parent process exits. With a port it runs as a shared daemon (-f keeps it in
 // the foreground for a supervisor such as runit).
+//
+// Protocols:
+// HTTP CONNECT, plain HTTP with absolute URLs, and SOCKS5 CONNECT (RFC 1928, with
+// RFC 1929 username/password authentication), all on the same port: a SOCKS5 client's
+// first byte is 5, which no HTTP request starts with.
 //
 // Architecture & Concurrency:
 // Designed as an efficient C replacement for runtime-heavy proxy scripts:
@@ -25,7 +30,13 @@
 // Security:
 // Android's loopback interface is shared by every app on the device, so any app can
 // reach this port. --auth-file makes the proxy require the token in that file
-// (Proxy-Authorization: Basic, any username) before it resolves or dials anything.
+// (Proxy-Authorization: Basic, or SOCKS5's password, with any username) before it
+// resolves or dials anything.
+//
+// Logging:
+// --log writes one line per connection: protocol, target, the username the client
+// gave (so tools can name themselves), the address connected to, the outcome, bytes
+// each way and duration. Plain-HTTP paths are never logged.
 //
 // Compilation:
 //   cc -O2 -o termux-http-proxy termux-http-proxy.c
@@ -99,6 +110,14 @@
 #define NS_RCODE_NXDOMAIN 3
 
 enum { ST_HEADER, ST_RESOLVE, ST_DIAL, ST_TUNNEL };
+// What a client speaks, which decides how success and failure are reported to it.
+enum { P_UNKNOWN, P_HTTP, P_CONNECT, P_SOCKS };
+// SOCKS5 negotiation, one stage per client message.
+enum { SOCKS_GREETING, SOCKS_AUTH, SOCKS_REQUEST };
+// Why a connection could not be set up. Each maps to an HTTP status, a SOCKS5 reply
+// code and a name for the log (see refuse()).
+enum { E_BAD_REQUEST, E_AUTH, E_TOO_LARGE, E_UNSUPPORTED, E_ADDRESS_TYPE, E_INTERNAL,
+       E_NO_ADDRESS, E_UNREACHABLE, E_REFUSED, E_DNS_TIMEOUT, E_CONNECT_TIMEOUT };
 
 // Everything needed to get from a parsed request to a connected upstream socket.
 // Allocated after the headers are parsed and freed once the tunnel starts, so an
@@ -106,7 +125,6 @@ enum { ST_HEADER, ST_RESOLVE, ST_DIAL, ST_TUNNEL };
 struct setup {
   char host[256];
   uint16_t port;
-  int is_connect;
   char *out;          // Bytes to send upstream once connected (rewritten request / early payload)
   int out_len;
   int dns_fd[2];      // Outstanding A and AAAA queries (-1 when answered or not issued)
@@ -118,6 +136,19 @@ struct setup {
   int dial_fd;        // Non-blocking connect in progress (-1 when none)
   int64_t dial_deadline; // Overall connect budget across addresses
   int dial_timed_out; // An attempt ran out of time (504 rather than 502 if all fail)
+  int last_err;       // errno of the last failed connect, to tell "refused" apart
+  int nxdomain;       // The name does not exist (for the log)
+};
+
+// One log line in the making: created for each client when --log is on, shared by
+// both ends of its tunnel, and written when the last of them closes.
+struct logrec {
+  int64_t start;
+  uint64_t up, down;  // Bytes client -> upstream and upstream -> client
+  const char *result; // "ok", or why setup failed; NULL when there is nothing to log
+  char user[33];      // Username the client gave, if any
+  char target[264];   // host:port it asked for
+  char addr[48];      // Address actually connected to
 };
 
 // State tracking for an individual connection and its upstream peer.
@@ -136,6 +167,10 @@ struct conn {
   int in_setup;       // Client connection not yet tunnelling; counted in n_setup
   int64_t deadline;   // When the current setup phase (or attempt) expires
   struct setup *su;   // Resolve/dial state; NULL outside ST_RESOLVE and ST_DIAL
+  unsigned char proto;       // P_*, known once the first bytes arrive
+  unsigned char socks_stage; // SOCKS_* while a SOCKS5 client negotiates
+  unsigned char upstream;    // The upstream end of a tunnel
+  struct logrec *log;        // NULL unless --log
 };
 
 static struct conn *conns[MAX_FDS];
@@ -146,6 +181,9 @@ static int n_setup; // Connections with a pending deadline; 0 lets epoll sleep i
 
 static char auth_token[TOKEN_MAX];
 static size_t auth_len; // 0 when authentication is disabled
+
+static int log_fd = -1;  // --log destination, -1 when off
+static int log_stamps;   // Prefix lines with the time (a supervisor's log adds its own)
 
 // ---- small helpers -------------------------------------------------------------------
 
@@ -221,6 +259,44 @@ static struct conn *conn_new(int fd) {
   c->state = ST_HEADER;
   conns[fd] = c;
   return c;
+}
+
+// ---- Logging -------------------------------------------------------------------------
+
+// Copies client-supplied text for the log, replacing anything that is not printable
+// ASCII (spaces included, which would break the fields) with '?'.
+static void log_copy(char *dst, size_t cap, const char *src, size_t len) {
+  size_t n = 0;
+  for (size_t i = 0; i < len && n + 1 < cap; i++) {
+    unsigned char ch = (unsigned char)src[i];
+    dst[n++] = ch > ' ' && ch < 0x7F ? (char)ch : '?';
+  }
+  dst[n] = 0;
+}
+
+static void log_emit(const struct conn *c, const struct logrec *l) {
+  static const char *const names[] = { "-", "http", "connect", "socks5" };
+  char buf[640];
+  size_t n = 0;
+  if (log_stamps) {
+    time_t now = time(NULL);
+    struct tm tm;
+    if (localtime_r(&now, &tm)) n = strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S ", &tm);
+  }
+  int64_t ms = monotonic_ms() - l->start;
+  int w = snprintf(buf + n, sizeof buf - n,
+                   "%s %s user=%s addr=%s result=%s up=%llu down=%llu time=%lld.%03llds\n",
+                   names[c->proto], l->target[0] ? l->target : "-", l->user[0] ? l->user : "-",
+                   l->addr[0] ? l->addr : "-", l->result, (unsigned long long)l->up,
+                   (unsigned long long)l->down, (long long)(ms / 1000), (long long)(ms % 1000));
+  if (w < 0) return;
+  n += (size_t)w;
+  if (n >= sizeof buf) { n = sizeof buf - 1; buf[n - 1] = '\n'; }
+  (void)!write(log_fd, buf, n); // One write per line, so lines never interleave
+}
+
+static void log_result(struct conn *c, const char *result) {
+  if (c->log) c->log->result = result;
 }
 
 // ---- Asynchronous resolver -----------------------------------------------------------
@@ -398,6 +474,11 @@ static void conn_close(struct conn *c) {
   leave_setup(c);
   setup_free(c->su);
   c->su = NULL;
+  // The last end of a tunnel to close writes the line.
+  if (c->log && !p) {
+    if (c->log->result) log_emit(c, c->log);
+    free(c->log);
+  }
   epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
   if (c->pipe_r >= 0) close(c->pipe_r);
   if (c->pipe_w >= 0) close(c->pipe_w);
@@ -439,7 +520,11 @@ static int pump(struct conn *c) {
     while (c->inflight > 0) {
       ssize_t w = splice(c->pipe_r, NULL, p->fd, NULL, c->inflight,
                          SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-      if (w > 0) { c->inflight -= (int)w; continue; }
+      if (w > 0) {
+        c->inflight -= (int)w;
+        if (c->log) *(c->upstream ? &c->log->down : &c->log->up) += (uint64_t)w;
+        continue;
+      }
       if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         // Upstream/downstream socket buffer saturated; apply backpressure to inbound side.
         c->want_out = 1;
@@ -471,16 +556,82 @@ static int pump(struct conn *c) {
 
 // ---- Connection Setup ----------------------------------------------------------------
 
-static void fail_with(struct conn *c, const char *status, const char *extra) {
-  char buf[256];
-  int n = snprintf(buf, sizeof buf, "HTTP/1.1 %s\r\n%sConnection: close\r\n\r\n", status,
-                   extra ? extra : "");
-  (void)write_all(c->fd, buf, (size_t)n); // Best effort notification prior to teardown
-  conn_close(c);
+// Builds a SOCKS5 reply into out (22 bytes at most) and returns its length. BND.ADDR
+// is the upstream socket's local address when there is one, 0.0.0.0:0 otherwise.
+static int socks_reply(uint8_t *out, int rep, int ufd) {
+  struct sockaddr_storage ss;
+  socklen_t len = sizeof ss;
+  out[0] = 5;
+  out[1] = (uint8_t)rep;
+  out[2] = 0;
+  if (ufd >= 0 && getsockname(ufd, (struct sockaddr *)&ss, &len) == 0) {
+    if (ss.ss_family == AF_INET6) {
+      struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+      out[3] = 4;
+      memcpy(out + 4, &sin6->sin6_addr, 16);
+      memcpy(out + 20, &sin6->sin6_port, 2);
+      return 22;
+    }
+    if (ss.ss_family == AF_INET) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+      out[3] = 1;
+      memcpy(out + 4, &sin->sin_addr, 4);
+      memcpy(out + 8, &sin->sin_port, 2);
+      return 10;
+    }
+  }
+  out[3] = 1;
+  memset(out + 4, 0, 6);
+  return 10;
 }
 
-static void fail(struct conn *c, const char *status) {
-  fail_with(c, status, NULL);
+// Tells the client why its connection could not be set up, in its own protocol, and
+// closes it.
+static void refuse(struct conn *c, int err, const char *detail) {
+  static const char *const status[] = {
+    [E_BAD_REQUEST] = "400 Bad Request",
+    [E_AUTH] = "407 Proxy Authentication Required",
+    [E_TOO_LARGE] = "431 Request Header Fields Too Large",
+    [E_UNSUPPORTED] = "501 Not Implemented",
+    [E_ADDRESS_TYPE] = "400 Bad Request",
+    [E_INTERNAL] = "500 Internal Server Error",
+    [E_NO_ADDRESS] = "502 Bad Gateway",
+    [E_UNREACHABLE] = "502 Bad Gateway",
+    [E_REFUSED] = "502 Bad Gateway",
+    [E_DNS_TIMEOUT] = "504 Gateway Timeout",
+    [E_CONNECT_TIMEOUT] = "504 Gateway Timeout",
+  };
+  // RFC 1928: 1 general failure, 3 network unreachable, 4 host unreachable,
+  // 5 connection refused, 7 command not supported, 8 address type not supported.
+  static const uint8_t socks[] = {
+    [E_BAD_REQUEST] = 1, [E_AUTH] = 1, [E_TOO_LARGE] = 1, [E_UNSUPPORTED] = 7,
+    [E_ADDRESS_TYPE] = 8, [E_INTERNAL] = 1, [E_NO_ADDRESS] = 4, [E_UNREACHABLE] = 4,
+    [E_REFUSED] = 5, [E_DNS_TIMEOUT] = 4, [E_CONNECT_TIMEOUT] = 4,
+  };
+  static const char *const names[] = {
+    [E_BAD_REQUEST] = "bad-request", [E_AUTH] = "auth-failed",
+    [E_TOO_LARGE] = "headers-too-large", [E_UNSUPPORTED] = "unsupported",
+    [E_ADDRESS_TYPE] = "unsupported-address-type", [E_INTERNAL] = "internal-error",
+    [E_NO_ADDRESS] = "no-address", [E_UNREACHABLE] = "unreachable",
+    [E_REFUSED] = "refused", [E_DNS_TIMEOUT] = "dns-timeout",
+    [E_CONNECT_TIMEOUT] = "connect-timeout",
+  };
+  log_result(c, detail ? detail : names[err]);
+  // Best effort notification prior to teardown
+  if (c->proto == P_SOCKS) {
+    uint8_t buf[22];
+    int rep = socks[err];
+    if (err == E_UNREACHABLE && c->su && c->su->last_err == ENETUNREACH) rep = 3;
+    (void)write_all(c->fd, (const char *)buf, (size_t)socks_reply(buf, rep, -1));
+  } else {
+    char buf[256];
+    int n = snprintf(buf, sizeof buf, "HTTP/1.1 %s\r\n%sConnection: close\r\n\r\n",
+                     status[err],
+                     err == E_AUTH ? "Proxy-Authenticate: Basic realm=\"termux-http-proxy\"\r\n"
+                                   : "");
+    (void)write_all(c->fd, buf, (size_t)n);
+  }
+  conn_close(c);
 }
 
 // Allocates and attaches an intermediate pipe to enable splice(2) operations on this connection.
@@ -494,23 +645,28 @@ static int arm(struct conn *c) {
   return 0;
 }
 
-static void start_tunnel(struct conn *c, int ufd, const char *reply, const char *head,
-                         int head_len) {
+static void start_tunnel(struct conn *c, int ufd, const char *reply, int reply_len,
+                         const char *head, int head_len) {
   struct conn *u = conn_new(ufd);
-  if (!u) { close(ufd); fail(c, "500 Internal Server Error"); return; }
+  if (!u) { close(ufd); refuse(c, E_INTERNAL, NULL); return; }
 
   if (arm(c) < 0 || arm(u) < 0) {
     c->peer = -1;
     conn_close(u);
-    fail(c, "500 Internal Server Error");
+    refuse(c, E_INTERNAL, NULL);
     return;
   }
   c->peer = ufd;
   u->peer = c->fd;
+  u->upstream = 1;
+  u->proto = c->proto;
+  u->log = c->log;
+  log_result(c, "ok");
 
-  if (reply && !write_all(c->fd, reply, strlen(reply))) { conn_close(c); return; }
+  if (reply_len > 0 && !write_all(c->fd, reply, (size_t)reply_len)) { conn_close(c); return; }
   // Forward any early body/pipelined payload buffered alongside the initial request headers.
   if (head_len > 0 && !write_all(ufd, head, (size_t)head_len)) { conn_close(c); return; }
+  if (c->log) c->log->up += (uint64_t)head_len;
 
   ep_add(ufd, EPOLLIN | EPOLLRDHUP);
   ep_mod(c);
@@ -528,8 +684,26 @@ static void connected(struct conn *c, int ufd) {
   struct setup *su = c->su;
   c->su = NULL;
   leave_setup(c);
-  start_tunnel(c, ufd, su->is_connect ? "HTTP/1.1 200 Connection Established\r\n\r\n" : NULL,
-               su->out, su->out_len);
+  if (c->log) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    if (getpeername(ufd, (struct sockaddr *)&ss, &len) == 0) {
+      const void *ip = ss.ss_family == AF_INET6
+                           ? (const void *)&((struct sockaddr_in6 *)&ss)->sin6_addr
+                           : (const void *)&((struct sockaddr_in *)&ss)->sin_addr;
+      inet_ntop(ss.ss_family, ip, c->log->addr, sizeof c->log->addr);
+    }
+  }
+  static const char established[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
+  uint8_t reply[sizeof established];
+  int reply_len = 0;
+  if (c->proto == P_CONNECT) {
+    memcpy(reply, established, sizeof established - 1);
+    reply_len = (int)sizeof established - 1;
+  } else if (c->proto == P_SOCKS) {
+    reply_len = socks_reply(reply, 0, ufd);
+  }
+  start_tunnel(c, ufd, (const char *)reply, reply_len, su->out, su->out_len);
   setup_free(su);
 }
 
@@ -549,17 +723,18 @@ static void try_next(struct conn *c) {
     su->next++;
 
     int fd = socket(sa->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) continue;
-    if (fd >= MAX_FDS) { close(fd); continue; }
+    if (fd < 0) { su->last_err = errno; continue; }
+    if (fd >= MAX_FDS) { close(fd); su->last_err = EMFILE; continue; }
     if (connect(fd, sa, len) == 0) { connected(c, fd); return; }
-    if (errno != EINPROGRESS) { close(fd); continue; }
+    if (errno != EINPROGRESS) { su->last_err = errno; close(fd); continue; }
     su->dial_fd = fd;
     owner[fd] = c;
     ep_add(fd, EPOLLOUT);
     c->deadline = now + remaining / left;
     return;
   }
-  fail(c, timed_out || su->dial_timed_out ? "504 Gateway Timeout" : "502 Bad Gateway");
+  if (timed_out || su->dial_timed_out) refuse(c, E_CONNECT_TIMEOUT, NULL);
+  else refuse(c, su->last_err == ECONNREFUSED ? E_REFUSED : E_UNREACHABLE, NULL);
 }
 
 static void begin_dial(struct conn *c) {
@@ -597,6 +772,7 @@ static void on_dial_ready(struct conn *c, int fd) {
     connected(c, fd);
     return;
   }
+  su->last_err = error ? error : errno;
   close(fd);
   try_next(c);
 }
@@ -624,7 +800,7 @@ static void begin_resolve(struct conn *c) {
   }
   resolve_blocking(su);
   if (su->naddr) begin_dial(c);
-  else fail(c, "502 Bad Gateway");
+  else refuse(c, E_NO_ADDRESS, NULL);
 }
 
 static void on_dns(struct conn *c, int fd) {
@@ -640,6 +816,7 @@ static void on_dns(struct conn *c, int fd) {
   int rcode = 0;
   int n = res_nresult(fd, &rcode, answer, sizeof answer); // Consumes and closes fd
   if (n > 0 && rcode == 0) parse_answer(answer, n, idx ? NS_T_AAAA : NS_T_A, su);
+  if (n > 0 && rcode == NS_RCODE_NXDOMAIN) su->nxdomain = 1;
 
   if (su->dns_left > 0) {
     // The other family has RESOLUTION_DELAY_MS to catch up; expire() then dials.
@@ -650,7 +827,7 @@ static void on_dns(struct conn *c, int fd) {
     return;
   }
   if (su->naddr) begin_dial(c);
-  else fail(c, "502 Bad Gateway");
+  else refuse(c, E_NO_ADDRESS, su->nxdomain ? "nxdomain" : NULL);
 }
 
 // Called when a setup phase outlives its deadline.
@@ -658,6 +835,7 @@ static void expire(struct conn *c) {
   struct setup *su = c->su;
   switch (c->state) {
   case ST_HEADER:
+    log_result(c, "header-timeout");
     conn_close(c);
     break;
   case ST_RESOLVE:
@@ -673,7 +851,7 @@ static void expire(struct conn *c) {
     // One family answering is enough: reached RESOLUTION_DELAY_MS after it did, or
     // at DNS_TIMEOUT_MS if an answer arrived without addresses.
     if (su->naddr) begin_dial(c);
-    else fail(c, "504 Gateway Timeout");
+    else refuse(c, E_DNS_TIMEOUT, NULL);
     break;
   case ST_DIAL:
     if (su->dial_fd >= 0) {
@@ -729,8 +907,9 @@ static int token_matches(const char *s, size_t len) {
 }
 
 // Accepts "Basic base64(user:token)" with any username, which is what clients send
-// for a proxy URL of the form http://user:token@127.0.0.1:port.
-static int credentials_ok(const char *value, size_t len) {
+// for a proxy URL of the form http://user:token@127.0.0.1:port. The username is copied
+// to user (for the log) when it is not NULL, whether or not the token matches.
+static int credentials_ok(const char *value, size_t len, char *user, size_t usercap) {
   if (len < 6 || strncasecmp(value, "basic ", 6) != 0) return 0;
   value += 6;
   len -= 6;
@@ -742,6 +921,7 @@ static int credentials_ok(const char *value, size_t len) {
   if (n < 0) return 0;
   char *colon = memchr(decoded, ':', (size_t)n);
   if (!colon) return 0;
+  if (user) log_copy(user, usercap, decoded, (size_t)(colon - decoded));
   size_t pass_len = (size_t)(decoded + n - (colon + 1));
   return token_matches(colon + 1, pass_len);
 }
@@ -897,7 +1077,6 @@ static int hop_by_hop(const char *line, size_t len) {
 // the upstream connection exists; any early payload is held and forwarded after it.
 static int prepare_connect(struct setup *su, char *target, const char *body, int body_len) {
   if (split_host_port(target, 443, su->host, sizeof su->host, &su->port) < 0) return -1;
-  su->is_connect = 1;
   if (body_len > 0) {
     su->out = malloc((size_t)body_len);
     if (!su->out) return -1;
@@ -958,8 +1137,179 @@ static int prepare_http(struct setup *su, const char *method, char *url, const c
   return 0;
 }
 
-// Ingests and processes incoming request bytes during ST_HEADER phase.
+// The request is parsed: stop reading from the client and look up the target. Anything
+// more it sends stays in the kernel buffer for the tunnel to pick up.
+static int start_setup(struct conn *c) {
+  free(c->req);
+  c->req = NULL;
+  if (c->log) {
+    char host[256];
+    log_copy(host, sizeof host, c->su->host, strlen(c->su->host));
+    int v6 = strchr(host, ':') != NULL;
+    snprintf(c->log->target, sizeof c->log->target, "%s%s%s:%u", v6 ? "[" : "", host,
+             v6 ? "]" : "", c->su->port);
+  }
+  // Until the tunnel exists, only errors and hangups matter on the client socket.
+  struct epoll_event ev = {0};
+  ev.data.fd = c->fd;
+  epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+  begin_resolve(c);
+  return 1;
+}
+
+// Parses a buffered HTTP request once its header block is complete.
 // Returns 1 if connection remains active, 0 if closed or errored.
+static int on_http(struct conn *c) {
+  // Search for the end of the HTTP header block (CRLF CRLF or LF LF).
+  char *end = memmem(c->req, (size_t)c->req_len, "\r\n\r\n", 4);
+  int sep = 4;
+  if (!end) { end = memmem(c->req, (size_t)c->req_len, "\n\n", 2); sep = 2; }
+  if (!end) {
+    if (c->req_len >= REQ_MAX) { refuse(c, E_TOO_LARGE, NULL); return 0; }
+    return 1;
+  }
+
+  char *body = end + sep;
+  int body_len = c->req_len - (int)(body - c->req);
+  *end = 0; // Terminate header string; body payload tracked by pointer and length
+
+  char *sp1 = strchr(c->req, ' ');
+  if (!sp1) { refuse(c, E_BAD_REQUEST, NULL); return 0; }
+  *sp1 = 0;
+  char *method = c->req;
+  char *url = sp1 + 1;
+  char *sp2 = strchr(url, ' ');
+  if (!sp2) { refuse(c, E_BAD_REQUEST, NULL); return 0; }
+  *sp2 = 0;
+  // Locate the start of headers following the request line.
+  char *hdrs = strchr(sp2 + 1, '\n');
+  hdrs = hdrs ? hdrs + 1 : end;
+  int hdrs_len = (int)(end - hdrs);
+
+  int is_connect = strcmp(method, "CONNECT") == 0;
+  if (is_connect) c->proto = P_CONNECT;
+  // A CONNECT target is only host:port, so it can be logged even when refused. A
+  // plain-HTTP URL may carry secrets in its path; only its host is ever logged.
+  if (c->log && is_connect) log_copy(c->log->target, sizeof c->log->target, url, strlen(url));
+
+  // Nothing is resolved or dialed for a client that has not authenticated.
+  size_t vlen = 0;
+  const char *v = find_header(hdrs, hdrs_len, "proxy-authorization:", &vlen);
+  int authorized = v && credentials_ok(v, vlen, c->log ? c->log->user : NULL,
+                                       c->log ? sizeof c->log->user : 0);
+  if (auth_len && !authorized) { refuse(c, E_AUTH, NULL); return 0; }
+
+  // Reject chunked requests to avoid parsing ambiguities during zero-copy forwarding.
+  if (!is_connect && find_header(hdrs, hdrs_len, "transfer-encoding:", &vlen)) {
+    refuse(c, E_UNSUPPORTED, NULL);
+    return 0;
+  }
+
+  struct setup *su = setup_new();
+  if (!su) { refuse(c, E_INTERNAL, NULL); return 0; }
+  c->su = su;
+  int rc = is_connect ? prepare_connect(su, url, body, body_len)
+                      : prepare_http(su, method, url, hdrs, hdrs_len, body, body_len);
+  if (rc < 0) { refuse(c, E_BAD_REQUEST, NULL); return 0; }
+  return start_setup(c);
+}
+
+// Drops the first n bytes of the buffered handshake.
+static void consume(struct conn *c, int n) {
+  memmove(c->req, c->req + n, (size_t)(c->req_len - n));
+  c->req_len -= n;
+}
+
+// The SOCKS5 request: VER CMD RSV ATYP DST.ADDR DST.PORT. Only CONNECT is supported.
+static int socks_request(struct conn *c) {
+  const uint8_t *b = (const uint8_t *)c->req;
+  int n = c->req_len;
+  if (n < 5) return 1;
+  int alen;
+  switch (b[3]) {
+  case 1: alen = 4; break;         // IPv4
+  case 3: alen = 1 + b[4]; break;  // Length-prefixed domain name
+  case 4: alen = 16; break;        // IPv6
+  default: refuse(c, E_ADDRESS_TYPE, NULL); return 0;
+  }
+  int need = 4 + alen + 2;
+  if (n < need) return 1;
+  if (b[0] != 5) { refuse(c, E_BAD_REQUEST, NULL); return 0; }
+  if (b[1] != 1) { refuse(c, E_UNSUPPORTED, NULL); return 0; } // BIND, UDP ASSOCIATE
+
+  struct setup *su = setup_new();
+  if (!su) { refuse(c, E_INTERNAL, NULL); return 0; }
+  c->su = su;
+  if (b[3] == 1) {
+    inet_ntop(AF_INET, b + 4, su->host, sizeof su->host);
+  } else if (b[3] == 4) {
+    inet_ntop(AF_INET6, b + 4, su->host, sizeof su->host);
+  } else {
+    if (b[4] == 0 || memchr(b + 5, 0, b[4])) { refuse(c, E_BAD_REQUEST, NULL); return 0; }
+    memcpy(su->host, b + 5, b[4]);
+    su->host[b[4]] = 0;
+  }
+  su->port = (uint16_t)(b[need - 2] << 8 | b[need - 1]);
+  if (su->port == 0) { refuse(c, E_BAD_REQUEST, NULL); return 0; }
+  // Data a client sent without waiting for the reply goes upstream once connected.
+  if (n > need) {
+    su->out = malloc((size_t)(n - need));
+    if (!su->out) { refuse(c, E_INTERNAL, NULL); return 0; }
+    memcpy(su->out, b + need, (size_t)(n - need));
+    su->out_len = n - need;
+  }
+  return start_setup(c);
+}
+
+// SOCKS5 negotiation (RFC 1928), with username/password authentication (RFC 1929)
+// whose password is the token. Clients may send the greeting, credentials and request
+// without waiting for each reply, so this handles every complete message buffered.
+// Returns 1 if connection remains active, 0 if closed or errored.
+static int on_socks(struct conn *c) {
+  for (;;) {
+    const uint8_t *b = (const uint8_t *)c->req;
+    int n = c->req_len;
+    if (c->socks_stage == SOCKS_REQUEST) return socks_request(c);
+
+    if (c->socks_stage == SOCKS_GREETING) {
+      // VER NMETHODS METHODS...
+      if (n < 2 || n < 2 + b[1]) return 1;
+      // With a token, only username/password will do. Without one, a client that
+      // insists on sending credentials is accepted and they are ignored.
+      int method = 0xFF;
+      if (memchr(b + 2, 2, b[1])) method = 2;
+      if (!auth_len && memchr(b + 2, 0, b[1])) method = 0;
+      uint8_t reply[2] = { 5, (uint8_t)method };
+      if (!write_all(c->fd, (const char *)reply, 2) || method == 0xFF) {
+        if (method == 0xFF) log_result(c, "auth-failed");
+        conn_close(c);
+        return 0;
+      }
+      consume(c, 2 + b[1]);
+      c->socks_stage = method == 2 ? SOCKS_AUTH : SOCKS_REQUEST;
+      continue;
+    }
+
+    // SOCKS_AUTH: VER ULEN UNAME PLEN PASSWD
+    if (n < 2) return 1;
+    int ulen = b[1];
+    if (n < 3 + ulen || n < 3 + ulen + b[2 + ulen]) return 1;
+    int plen = b[2 + ulen];
+    if (c->log) log_copy(c->log->user, sizeof c->log->user, (const char *)b + 2, (size_t)ulen);
+    int ok = b[0] == 1 && (!auth_len || token_matches((const char *)b + 3 + ulen, (size_t)plen));
+    uint8_t reply[2] = { 1, ok ? 0 : 1 };
+    if (!write_all(c->fd, (const char *)reply, 2) || !ok) {
+      if (!ok) log_result(c, "auth-failed");
+      conn_close(c);
+      return 0;
+    }
+    consume(c, 3 + ulen + plen);
+    c->socks_stage = SOCKS_REQUEST;
+  }
+}
+
+// Reads request bytes during the ST_HEADER phase; the first byte tells SOCKS5 (5)
+// from HTTP. Returns 1 if connection remains active, 0 if closed or errored.
 static int on_header(struct conn *c) {
   if (!c->req) {
     c->req = malloc(REQ_MAX);
@@ -973,70 +1323,8 @@ static int on_header(struct conn *c) {
     return 0;
   }
   c->req_len += (int)r;
-
-  // Search for the end of the HTTP header block (CRLF CRLF or LF LF).
-  char *end = memmem(c->req, (size_t)c->req_len, "\r\n\r\n", 4);
-  int sep = 4;
-  if (!end) { end = memmem(c->req, (size_t)c->req_len, "\n\n", 2); sep = 2; }
-  if (!end) {
-    if (c->req_len >= REQ_MAX) { fail(c, "431 Request Header Fields Too Large"); return 0; }
-    return 1;
-  }
-
-  char *body = end + sep;
-  int body_len = c->req_len - (int)(body - c->req);
-  *end = 0; // Terminate header string; body payload tracked by pointer and length
-
-  char *sp1 = strchr(c->req, ' ');
-  if (!sp1) { fail(c, "400 Bad Request"); return 0; }
-  *sp1 = 0;
-  char *method = c->req;
-  char *url = sp1 + 1;
-  char *sp2 = strchr(url, ' ');
-  if (!sp2) { fail(c, "400 Bad Request"); return 0; }
-  *sp2 = 0;
-  // Locate the start of headers following the request line.
-  char *hdrs = strchr(sp2 + 1, '\n');
-  hdrs = hdrs ? hdrs + 1 : end;
-  int hdrs_len = (int)(end - hdrs);
-
-  // Nothing is resolved or dialed for a client that has not authenticated.
-  if (auth_len) {
-    size_t vlen = 0;
-    const char *v = find_header(hdrs, hdrs_len, "proxy-authorization:", &vlen);
-    if (!v || !credentials_ok(v, vlen)) {
-      fail_with(c, "407 Proxy Authentication Required",
-                "Proxy-Authenticate: Basic realm=\"termux-http-proxy\"\r\n");
-      return 0;
-    }
-  }
-
-  int is_connect = strcmp(method, "CONNECT") == 0;
-  // Reject chunked requests to avoid parsing ambiguities during zero-copy forwarding.
-  if (!is_connect) {
-    size_t vlen;
-    if (find_header(hdrs, hdrs_len, "transfer-encoding:", &vlen)) {
-      fail(c, "501 Not Implemented");
-      return 0;
-    }
-  }
-
-  struct setup *su = setup_new();
-  if (!su) { fail(c, "500 Internal Server Error"); return 0; }
-  c->su = su;
-  int rc = is_connect ? prepare_connect(su, url, body, body_len)
-                      : prepare_http(su, method, url, hdrs, hdrs_len, body, body_len);
-  if (rc < 0) { fail(c, "400 Bad Request"); return 0; }
-  free(c->req);
-  c->req = NULL;
-
-  // Until the tunnel exists, only errors and hangups matter on the client socket.
-  // Anything more it sends stays in the kernel buffer for the tunnel to pick up.
-  struct epoll_event ev = {0};
-  ev.data.fd = c->fd;
-  epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
-  begin_resolve(c);
-  return 1;
+  if (c->proto == P_UNKNOWN) c->proto = c->req[0] == 5 ? P_SOCKS : P_HTTP;
+  return c->proto == P_SOCKS ? on_socks(c) : on_http(c);
 }
 
 // ---- Main Event Loop & Lifecycle -----------------------------------------------------
@@ -1066,12 +1354,15 @@ static void expire_due(void) {
 static void usage(void) {
   fprintf(stderr,
           "usage: termux-http-proxy [--port PORT | PORT] [-f | -d] [--auth-file PATH]\n"
+          "                         [--log PATH]\n"
           "  (no port)          bind a free loopback port, print it, exit with the parent\n"
           "  --port PORT, PORT  bind PORT and detach as a daemon\n"
           "  -f                 with a port: stay in the foreground (for runit)\n"
           "  -d                 detach even without a port\n"
           "  --auth-file PATH   require Proxy-Authorization with the token in PATH\n"
-          "                     (created with a random token, mode 0600, if missing)\n");
+          "                     (created with a random token, mode 0600, if missing)\n"
+          "  --log PATH         append a line per connection to PATH (mode 0600);\n"
+          "                     - writes to stderr without timestamps, for runit\n");
 }
 
 static int parse_port(const char *s) {
@@ -1088,6 +1379,7 @@ int main(int argc, char **argv) {
   int daemon_mode = 0;
   int foreground = 0; // -f: fixed port but stay attached, for a supervisor such as runit
   const char *auth_file = NULL;
+  const char *log_path = NULL;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-d") == 0) {
       daemon_mode = 1;
@@ -1099,6 +1391,8 @@ int main(int argc, char **argv) {
       daemon_mode = 1;
     } else if (strcmp(argv[i], "--auth-file") == 0 && i + 1 < argc) {
       auth_file = argv[++i];
+    } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
+      log_path = argv[++i];
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       usage();
       return 0;
@@ -1113,6 +1407,20 @@ int main(int argc, char **argv) {
   // Before daemon(): a daemon's stderr is /dev/null, and a bad token file should be
   // reported, not silently turned into an unauthenticated proxy.
   if (auth_file && load_token(auth_file) < 0) return 1;
+  if (log_path && strcmp(log_path, "-") == 0) {
+    if (daemon_mode && !foreground) {
+      fprintf(stderr, "termux-http-proxy: --log - needs -f: a detached daemon has no stderr\n");
+      return 2;
+    }
+    log_fd = STDERR_FILENO;
+  } else if (log_path) {
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (log_fd < 0) {
+      fprintf(stderr, "termux-http-proxy: cannot open %s: %s\n", log_path, strerror(errno));
+      return 1;
+    }
+    log_stamps = 1;
+  }
   resolver_init();
 
   if (daemon_mode && !foreground) {
@@ -1194,6 +1502,7 @@ int main(int argc, char **argv) {
           c->in_setup = 1;
           n_setup++;
           c->deadline = monotonic_ms() + HEADER_TIMEOUT_MS;
+          if (log_fd >= 0 && (c->log = calloc(1, sizeof *c->log))) c->log->start = monotonic_ms();
           setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
           ep_add(cfd, EPOLLIN | EPOLLRDHUP);
         }
@@ -1229,7 +1538,10 @@ int main(int argc, char **argv) {
         continue;
       }
       if (c->state == ST_RESOLVE || c->state == ST_DIAL) {
-        if (e & (EPOLLERR | EPOLLHUP)) conn_close(c); // Client gave up; cancel the setup
+        if (e & (EPOLLERR | EPOLLHUP)) { // Client gave up; cancel the setup
+          log_result(c, "client-left");
+          conn_close(c);
+        }
         continue;
       }
 

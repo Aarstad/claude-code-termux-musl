@@ -13,9 +13,11 @@
 // the foreground for a supervisor such as runit).
 //
 // Protocols:
-// HTTP CONNECT, plain HTTP with absolute URLs, and SOCKS5 CONNECT (RFC 1928, with
-// RFC 1929 username/password authentication), all on the same port: a SOCKS5 client's
-// first byte is 5, which no HTTP request starts with.
+// HTTP CONNECT, plain HTTP with absolute URLs, and SOCKS5 CONNECT and UDP ASSOCIATE
+// (RFC 1928, with RFC 1929 username/password authentication), all on the same port: a
+// SOCKS5 client's first byte is 5, which no HTTP request starts with. UDP datagrams to
+// port 53 are DNS queries: Android's resolver answers them (resNetworkSend), so they
+// get Private DNS and work where raw port-53 traffic is blocked.
 //
 // Architecture & Concurrency:
 // Designed as an efficient C replacement for runtime-heavy proxy scripts:
@@ -114,9 +116,9 @@
 #define NS_T_AAAA 28
 #define NS_RCODE_NXDOMAIN 3
 
-enum { ST_HEADER, ST_RESOLVE, ST_DIAL, ST_TUNNEL };
+enum { ST_HEADER, ST_RESOLVE, ST_DIAL, ST_TUNNEL, ST_UDP };
 // What a client speaks, which decides how success and failure are reported to it.
-enum { P_UNKNOWN, P_HTTP, P_CONNECT, P_SOCKS };
+enum { P_UNKNOWN, P_HTTP, P_CONNECT, P_SOCKS, P_UDP };
 // SOCKS5 negotiation, one stage per client message.
 enum { SOCKS_GREETING, SOCKS_AUTH, SOCKS_REQUEST };
 // Why a connection could not be set up. Each maps to an HTTP status, a SOCKS5 reply
@@ -143,6 +145,27 @@ struct setup {
   int dial_timed_out; // An attempt ran out of time (504 rather than 502 if all fail)
   int last_err;       // errno of the last failed connect, to tell "refused" apart
   int nxdomain;       // The name does not exist (for the log)
+};
+
+// SOCKS5 UDP ASSOCIATE (see "SOCKS5 UDP" below).
+#define UDP_PEERS 64    // Recent destinations remembered: only they may send replies
+#define UDP_QUERIES 16  // DNS queries in flight per association
+#define UDP_MAX 65535
+
+struct udp_query {
+  int fd;                      // resNetworkSend answer descriptor, -1 when the slot is free
+  int64_t deadline;
+  struct sockaddr_storage dst; // Where the client addressed it; the answer comes "from" there
+};
+
+struct udp_assoc {
+  int relay;                      // Datagram socket the client sends to
+  int out[2];                     // Outbound IPv4 and IPv6 sockets, -1 until needed
+  int locked;                     // relay is connected to the client's address
+  struct sockaddr_storage client; // The client's address (port 0 until known: any)
+  struct sockaddr_storage peers[UDP_PEERS];
+  int npeers, next_peer;
+  struct udp_query q[UDP_QUERIES];
 };
 
 // One log line in the making: created for each client when --log is on, shared by
@@ -176,7 +199,10 @@ struct conn {
   unsigned char socks_stage; // SOCKS_* while a SOCKS5 client negotiates
   unsigned char upstream;    // The upstream end of a tunnel
   struct logrec *log;        // NULL unless --log
+  struct udp_assoc *ua;      // ST_UDP: the association this control connection owns
 };
+
+static void udp_free(struct udp_assoc *ua);
 
 static struct conn *conns[MAX_FDS];
 // Resolver and dialing descriptors, mapped to the client connection that owns them.
@@ -279,8 +305,9 @@ static void log_copy(char *dst, size_t cap, const char *src, size_t len) {
   dst[n] = 0;
 }
 
-static void log_emit(const struct conn *c, const struct logrec *l) {
-  static const char *const names[] = { "-", "http", "connect", "socks5" };
+static const char *const proto_names[] = { "-", "http", "connect", "socks5", "socks5-udp" };
+
+static void log_emit(const char *proto, const struct logrec *l) {
   char buf[640];
   size_t n = 0;
   if (log_stamps) {
@@ -291,7 +318,7 @@ static void log_emit(const struct conn *c, const struct logrec *l) {
   int64_t ms = monotonic_ms() - l->start;
   int w = snprintf(buf + n, sizeof buf - n,
                    "%s %s user=%s addr=%s result=%s up=%llu down=%llu time=%lld.%03llds\n",
-                   names[c->proto], l->target[0] ? l->target : "-", l->user[0] ? l->user : "-",
+                   proto, l->target[0] ? l->target : "-", l->user[0] ? l->user : "-",
                    l->addr[0] ? l->addr : "-", l->result, (unsigned long long)l->up,
                    (unsigned long long)l->down, (long long)(ms / 1000), (long long)(ms % 1000));
   if (w < 0) return;
@@ -319,6 +346,7 @@ typedef int (*res_nquery_fn)(unsigned netid, const char *dname, int ns_class, in
                              uint32_t flags);
 typedef int (*res_nresult_fn)(int fd, int *rcode, uint8_t *answer, size_t anslen);
 typedef void (*res_cancel_fn)(int fd);
+typedef int (*res_nsend_fn)(unsigned netid, const uint8_t *msg, size_t msglen, uint32_t flags);
 
 // Resolved at startup with dlsym, so the binary still builds for (and runs on) API
 // levels without them; the loop then falls back to blocking getaddrinfo. Tests may
@@ -326,6 +354,7 @@ typedef void (*res_cancel_fn)(int fd);
 static res_nquery_fn res_nquery;
 static res_nresult_fn res_nresult;
 static res_cancel_fn res_cancel;
+static res_nsend_fn res_nsend; // Raw DNS queries (SOCKS5 UDP to port 53); may be NULL
 
 static void resolver_init(void) {
   if (res_nquery) return;
@@ -343,6 +372,7 @@ static void resolver_init(void) {
     res_nquery = q;
     res_nresult = r;
     res_cancel = x;
+    *(void **)&res_nsend = dlsym(h, "resNetworkSend");
     return;
   }
   dlclose(h);
@@ -479,9 +509,11 @@ static void conn_close(struct conn *c) {
   leave_setup(c);
   setup_free(c->su);
   c->su = NULL;
+  udp_free(c->ua);
+  c->ua = NULL;
   // The last end of a tunnel to close writes the line.
   if (c->log && !p) {
-    if (c->log->result) log_emit(c, c->log);
+    if (c->log->result) log_emit(proto_names[c->proto], c->log);
     free(c->log);
   }
   epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
@@ -836,6 +868,8 @@ static void on_dns(struct conn *c, int fd) {
   else refuse(c, E_NO_ADDRESS, su->nxdomain ? "nxdomain" : NULL);
 }
 
+static void udp_expire(struct conn *c);
+
 // Called when a setup phase outlives its deadline.
 static void expire(struct conn *c) {
   struct setup *su = c->su;
@@ -858,6 +892,9 @@ static void expire(struct conn *c) {
     // at DNS_TIMEOUT_MS if an answer arrived without addresses.
     if (su->naddr) begin_dial(c);
     else refuse(c, E_DNS_TIMEOUT, NULL);
+    break;
+  case ST_UDP:
+    udp_expire(c);
     break;
   case ST_DIAL:
     if (su->dial_fd >= 0) {
@@ -1088,6 +1125,325 @@ static void on_sighup(int sig) {
   deny_reload = 1;
 }
 
+// ---- SOCKS5 UDP ----------------------------------------------------------------------
+
+// UDP ASSOCIATE gives the client a datagram socket on the address its control
+// connection reached; the association lasts as long as that connection. Datagrams
+// carry a small header naming their destination (RFC 1928 section 7).
+//
+// Loopback is shared with every app, and datagrams carry no token, so the relay only
+// accepts datagrams from the control connection's IP (and the port the client
+// declared, if it did), then connect()s to the first sender, after which the kernel
+// drops everyone else's. Replies are accepted only from addresses the client has sent
+// to recently, so the outbound sockets are not open to the internet at large.
+
+static int sa_len(const struct sockaddr_storage *ss) {
+  return ss->ss_family == AF_INET6 ? (int)sizeof(struct sockaddr_in6)
+                                   : (int)sizeof(struct sockaddr_in);
+}
+
+static uint16_t sa_port(const struct sockaddr_storage *ss) {
+  return ntohs(ss->ss_family == AF_INET6 ? ((const struct sockaddr_in6 *)ss)->sin6_port
+                                         : ((const struct sockaddr_in *)ss)->sin_port);
+}
+
+static int sa_same_ip(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+  if (a->ss_family != b->ss_family) return 0;
+  if (a->ss_family == AF_INET6)
+    return memcmp(&((const struct sockaddr_in6 *)a)->sin6_addr,
+                  &((const struct sockaddr_in6 *)b)->sin6_addr, 16) == 0;
+  return ((const struct sockaddr_in *)a)->sin_addr.s_addr ==
+         ((const struct sockaddr_in *)b)->sin_addr.s_addr;
+}
+
+static int sa_same(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+  return sa_same_ip(a, b) && sa_port(a) == sa_port(b);
+}
+
+// Parses the address in a SOCKS5 header at b (ATYP first). Returns the header's
+// remaining length (address and port), or 0 if it is not an IP address or is cut off.
+static int socks_addr(const uint8_t *b, int n, struct sockaddr_storage *ss) {
+  memset(ss, 0, sizeof *ss);
+  if (n >= 7 && b[0] == 1) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)ss;
+    sin->sin_family = AF_INET;
+    memcpy(&sin->sin_addr, b + 1, 4);
+    memcpy(&sin->sin_port, b + 5, 2);
+    return 7;
+  }
+  if (n >= 19 && b[0] == 4) {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
+    sin6->sin6_family = AF_INET6;
+    memcpy(&sin6->sin6_addr, b + 1, 16);
+    memcpy(&sin6->sin6_port, b + 17, 2);
+    return 19;
+  }
+  return 0;
+}
+
+static void format_addr(char *out, size_t cap, const struct sockaddr_storage *ss) {
+  char ip[INET6_ADDRSTRLEN] = "?";
+  int v6 = ss->ss_family == AF_INET6;
+  inet_ntop(ss->ss_family, v6 ? (const void *)&((const struct sockaddr_in6 *)ss)->sin6_addr
+                              : (const void *)&((const struct sockaddr_in *)ss)->sin_addr,
+            ip, sizeof ip);
+  snprintf(out, cap, "%s%s%s:%u", v6 ? "[" : "", ip, v6 ? "]" : "", sa_port(ss));
+}
+
+// Sends a datagram to the client, headed with the address it came from.
+static void udp_to_client(struct conn *c, const struct sockaddr_storage *from,
+                          const uint8_t *data, int len) {
+  static uint8_t pkt[22 + UDP_MAX];
+  if (!c->ua->locked || len > UDP_MAX) return;
+  int h = 4;
+  pkt[0] = pkt[1] = pkt[2] = 0;
+  if (from->ss_family == AF_INET6) {
+    pkt[3] = 4;
+    memcpy(pkt + 4, &((const struct sockaddr_in6 *)from)->sin6_addr, 16);
+    memcpy(pkt + 20, &((const struct sockaddr_in6 *)from)->sin6_port, 2);
+    h = 22;
+  } else {
+    pkt[3] = 1;
+    memcpy(pkt + 4, &((const struct sockaddr_in *)from)->sin_addr, 4);
+    memcpy(pkt + 8, &((const struct sockaddr_in *)from)->sin_port, 2);
+    h = 10;
+  }
+  memcpy(pkt + h, data, (size_t)len);
+  // Best effort, like UDP itself: a full socket buffer drops the datagram.
+  if (send(c->ua->relay, pkt, (size_t)(h + len), MSG_DONTWAIT) > 0 && c->log)
+    c->log->down += (uint64_t)len;
+}
+
+// The name asked about in a DNS query, into out. Returns the offset just past the
+// question, or -1 if the message is not a single-question query.
+static int query_name(const uint8_t *q, int len, char *out, size_t cap) {
+  if (len < 12 || (q[2] & 0x80) || (q[4] << 8 | q[5]) != 1) return -1;
+  size_t n = 0;
+  int off = 12;
+  for (;;) {
+    if (off >= len) return -1;
+    int l = q[off++];
+    if (l == 0) break;
+    if (l > 63 || off + l > len || n + (size_t)l + 2 > cap) return -1; // No compression
+    if (n) out[n++] = '.';
+    memcpy(out + n, q + off, (size_t)l);
+    n += (size_t)l;
+    off += l;
+  }
+  out[n] = 0;
+  return off + 4 <= len ? off + 4 : -1;
+}
+
+// Keeps the connection's deadline at its earliest query, or clears it.
+static void udp_deadline(struct conn *c) {
+  int64_t soonest = INT64_MAX;
+  for (int i = 0; i < UDP_QUERIES; i++)
+    if (c->ua->q[i].fd >= 0 && c->ua->q[i].deadline < soonest) soonest = c->ua->q[i].deadline;
+  if (soonest == INT64_MAX) { leave_setup(c); return; }
+  if (!c->in_setup) { c->in_setup = 1; n_setup++; }
+  c->deadline = soonest;
+}
+
+static void udp_cancel(struct udp_query *q) {
+  epoll_ctl(epfd, EPOLL_CTL_DEL, q->fd, NULL);
+  owner[q->fd] = NULL;
+  res_cancel(q->fd); // Closes the descriptor
+  q->fd = -1;
+}
+
+static void udp_expire(struct conn *c) {
+  int64_t now = monotonic_ms();
+  for (int i = 0; i < UDP_QUERIES; i++)
+    if (c->ua->q[i].fd >= 0 && now >= c->ua->q[i].deadline) udp_cancel(&c->ua->q[i]);
+  udp_deadline(c); // No answer is sent; the client's resolver retries or gives up
+}
+
+// A DNS query: answered by Android's resolver, or NXDOMAIN for a denied name.
+// Returns 0 if it should be relayed as an ordinary datagram instead.
+static int udp_dns(struct conn *c, const struct sockaddr_storage *dst, const uint8_t *q, int len) {
+  char name[256];
+  int qend = query_name(q, len, name, sizeof name);
+  if (qend > 0 && deny_size && host_denied(name)) {
+    uint8_t reply[12 + 260];
+    memcpy(reply, q, (size_t)qend);
+    reply[2] = (uint8_t)(0x80 | (q[2] & 0x79)); // QR, keeping the opcode and RD
+    reply[3] = 0x80 | NS_RCODE_NXDOMAIN;        // RA
+    memset(reply + 6, 0, 6);                    // No answer, authority or additional
+    udp_to_client(c, dst, reply, qend);
+    if (c->log) {
+      struct logrec l = { .start = monotonic_ms(), .result = "blocked" };
+      memcpy(l.user, c->log->user, sizeof l.user);
+      log_copy(l.target, sizeof l.target, name, strlen(name));
+      log_emit("dns", &l);
+    }
+    return 1;
+  }
+  struct udp_query *slot = NULL;
+  for (int i = 0; i < UDP_QUERIES && !slot; i++)
+    if (c->ua->q[i].fd < 0) slot = &c->ua->q[i];
+  if (!slot) return 1; // Too many in flight: drop it, and the client will retry
+  int fd = res_nsend(0 /* NETID_UNSET: the default network */, q, (size_t)len, 0);
+  if (fd < 0) return 0;
+  if (fd >= MAX_FDS) { res_cancel(fd); return 1; }
+  slot->fd = fd;
+  slot->dst = *dst;
+  slot->deadline = monotonic_ms() + DNS_TIMEOUT_MS;
+  owner[fd] = c;
+  ep_add(fd, EPOLLIN);
+  udp_deadline(c);
+  return 1;
+}
+
+static void udp_dns_answer(struct conn *c, struct udp_query *slot) {
+  static uint8_t answer[UDP_MAX];
+  int fd = slot->fd;
+  epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+  owner[fd] = NULL;
+  slot->fd = -1;
+  int rcode = 0;
+  int n = res_nresult(fd, &rcode, answer, sizeof answer); // Consumes and closes fd
+  if (n > 0) udp_to_client(c, &slot->dst, answer, n);
+  udp_deadline(c);
+}
+
+// A datagram from the client: RSV RSV FRAG ATYP DST.ADDR DST.PORT DATA.
+static void udp_from_client(struct conn *c, const uint8_t *b, int n) {
+  struct udp_assoc *ua = c->ua;
+  struct sockaddr_storage dst;
+  // Fragments are not supported (RFC 1928 lets a server drop them), nor are domain
+  // names: tun2socks-style clients send the IP address they saw.
+  if (n < 4 || b[2] != 0) return;
+  int alen = socks_addr(b + 3, n - 3, &dst);
+  if (!alen || sa_port(&dst) == 0) return;
+  const uint8_t *data = b + 3 + alen;
+  int len = n - 3 - alen;
+  if (c->log) {
+    c->log->up += (uint64_t)len;
+    if (!c->log->target[0]) format_addr(c->log->target, sizeof c->log->target, &dst);
+  }
+  if (sa_port(&dst) == 53 && res_nsend && udp_dns(c, &dst, data, len)) return;
+
+  int v6 = dst.ss_family == AF_INET6;
+  if (ua->out[v6] < 0) {
+    int s = socket(dst.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (s < 0) return;
+    if (s >= MAX_FDS) { close(s); return; }
+    ua->out[v6] = s;
+    owner[s] = c;
+    ep_add(s, EPOLLIN);
+  }
+  if (sendto(ua->out[v6], data, (size_t)len, 0, (struct sockaddr *)&dst, (socklen_t)sa_len(&dst)) < 0)
+    return;
+  for (int i = 0; i < ua->npeers; i++)
+    if (sa_same(&ua->peers[i], &dst)) return;
+  ua->peers[ua->next_peer] = dst;
+  ua->next_peer = (ua->next_peer + 1) % UDP_PEERS;
+  if (ua->npeers < UDP_PEERS) ua->npeers++;
+}
+
+// Readiness on one of an association's descriptors.
+static void on_udp(struct conn *c, int fd) {
+  static uint8_t buf[UDP_MAX + 1];
+  struct udp_assoc *ua = c->ua;
+  for (int i = 0; i < UDP_QUERIES; i++) {
+    if (ua->q[i].fd == fd) {
+      if (ready(fd, POLLIN)) udp_dns_answer(c, &ua->q[i]);
+      return;
+    }
+  }
+  for (;;) {
+    struct sockaddr_storage src;
+    socklen_t slen = sizeof src;
+    ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&src, &slen);
+    if (n < 0) {
+      // A connected UDP socket reports an earlier ICMP error once; carry on.
+      if (errno == EINTR || errno == ECONNREFUSED) continue;
+      return;
+    }
+    if (fd == ua->relay) {
+      if (!ua->locked) {
+        if (!sa_same_ip(&src, &ua->client)) continue;
+        if (sa_port(&ua->client) && sa_port(&src) != sa_port(&ua->client)) continue;
+        if (connect(fd, (struct sockaddr *)&src, slen) < 0) continue;
+        ua->client = src;
+        ua->locked = 1;
+      } else if (!sa_same(&src, &ua->client)) {
+        continue; // Queued before the relay was connected
+      }
+      udp_from_client(c, buf, (int)n);
+      if (!c->ua) return;
+    } else {
+      int known = 0;
+      for (int i = 0; i < ua->npeers && !known; i++) known = sa_same(&ua->peers[i], &src);
+      if (known) udp_to_client(c, &src, buf, (int)n);
+    }
+  }
+}
+
+static void udp_close_fd(int fd) {
+  if (fd < 0) return;
+  epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+  owner[fd] = NULL;
+  close(fd);
+}
+
+static void udp_free(struct udp_assoc *ua) {
+  if (!ua) return;
+  for (int i = 0; i < UDP_QUERIES; i++)
+    if (ua->q[i].fd >= 0) udp_cancel(&ua->q[i]);
+  udp_close_fd(ua->relay);
+  udp_close_fd(ua->out[0]);
+  udp_close_fd(ua->out[1]);
+  free(ua);
+}
+
+// UDP ASSOCIATE: the request's DST.ADDR/DST.PORT is where the client will send from,
+// or zeros if it does not know yet.
+static int udp_associate(struct conn *c, uint16_t client_port) {
+  struct udp_assoc *ua = calloc(1, sizeof *ua);
+  if (!ua) { refuse(c, E_INTERNAL, NULL); return 0; }
+  ua->relay = ua->out[0] = ua->out[1] = -1;
+  for (int i = 0; i < UDP_QUERIES; i++) ua->q[i].fd = -1;
+  c->ua = ua;
+
+  struct sockaddr_storage local;
+  socklen_t llen = sizeof local, plen = sizeof ua->client;
+  if (getpeername(c->fd, (struct sockaddr *)&ua->client, &plen) < 0 ||
+      getsockname(c->fd, (struct sockaddr *)&local, &llen) < 0) {
+    refuse(c, E_INTERNAL, NULL);
+    return 0;
+  }
+  if (ua->client.ss_family == AF_INET6) ((struct sockaddr_in6 *)&ua->client)->sin6_port = htons(client_port);
+  else ((struct sockaddr_in *)&ua->client)->sin_port = htons(client_port);
+  if (local.ss_family == AF_INET6) ((struct sockaddr_in6 *)&local)->sin6_port = 0;
+  else ((struct sockaddr_in *)&local)->sin_port = 0;
+  int relay = socket(local.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (relay >= MAX_FDS) { close(relay); relay = -1; }
+  if (relay < 0 || bind(relay, (struct sockaddr *)&local, llen) < 0) {
+    if (relay >= 0) close(relay);
+    refuse(c, E_INTERNAL, NULL);
+    return 0;
+  }
+  ua->relay = relay;
+  owner[relay] = c;
+  ep_add(relay, EPOLLIN);
+
+  free(c->req);
+  c->req = NULL;
+  leave_setup(c);
+  c->state = ST_UDP;
+  uint8_t reply[22];
+  int rlen = socks_reply(reply, 0, relay);
+  c->proto = P_UDP;
+  log_result(c, "ok");
+  if (!write_all(c->fd, (const char *)reply, (size_t)rlen)) { conn_close(c); return 0; }
+  // The control connection now only signals the end of the association.
+  struct epoll_event ev = { .events = EPOLLIN | EPOLLRDHUP };
+  ev.data.fd = c->fd;
+  epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+  return 1;
+}
+
 // ---- Request parsing -----------------------------------------------------------------
 
 // Splits "host", "host:port", "[v6]" or "[v6]:port" into its parts. Returns 0 on
@@ -1291,7 +1647,8 @@ static void consume(struct conn *c, int n) {
   c->req_len -= n;
 }
 
-// The SOCKS5 request: VER CMD RSV ATYP DST.ADDR DST.PORT. Only CONNECT is supported.
+// The SOCKS5 request: VER CMD RSV ATYP DST.ADDR DST.PORT. CONNECT and UDP ASSOCIATE
+// are supported; BIND is not.
 static int socks_request(struct conn *c) {
   const uint8_t *b = (const uint8_t *)c->req;
   int n = c->req_len;
@@ -1306,7 +1663,8 @@ static int socks_request(struct conn *c) {
   int need = 4 + alen + 2;
   if (n < need) return 1;
   if (b[0] != 5) { refuse(c, E_BAD_REQUEST, NULL); return 0; }
-  if (b[1] != 1) { refuse(c, E_UNSUPPORTED, NULL); return 0; } // BIND, UDP ASSOCIATE
+  if (b[1] == 3) return udp_associate(c, (uint16_t)(b[need - 2] << 8 | b[need - 1]));
+  if (b[1] != 1) { refuse(c, E_UNSUPPORTED, NULL); return 0; } // BIND
 
   struct setup *su = setup_new();
   if (!su) { refuse(c, E_INTERNAL, NULL); return 0; }
@@ -1618,6 +1976,7 @@ int main(int argc, char **argv) {
       if (o) {
         if (o->state == ST_RESOLVE) on_dns(o, fd);
         else if (o->state == ST_DIAL) on_dial_ready(o, fd);
+        else if (o->state == ST_UDP) on_udp(o, fd);
         continue;
       }
 
@@ -1627,6 +1986,15 @@ int main(int argc, char **argv) {
       if (c->state == ST_HEADER) {
         if (e & (EPOLLERR | EPOLLHUP)) { conn_close(c); continue; }
         if (e & (EPOLLIN | EPOLLRDHUP)) on_header(c);
+        continue;
+      }
+      if (c->state == ST_UDP) {
+        // The association ends with its control connection. Anything the client sends
+        // on it is meaningless and discarded.
+        char junk[256];
+        ssize_t r = read(fd, junk, sizeof junk);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR) || (e & (EPOLLERR | EPOLLHUP)))
+          conn_close(c);
         continue;
       }
       if (c->state == ST_RESOLVE || c->state == ST_DIAL) {

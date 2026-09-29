@@ -150,12 +150,27 @@ struct setup {
 // SOCKS5 UDP ASSOCIATE (see "SOCKS5 UDP" below).
 #define UDP_PEERS 64    // Recent destinations remembered: only they may send replies
 #define UDP_QUERIES 16  // DNS queries in flight per association
+#define UDP_NAMES 4     // Destination names remembered per association
+#define UDP_NAME_TTL_MS 60000
 #define UDP_MAX 65535
 
 struct udp_query {
-  int fd;                      // resNetworkSend answer descriptor, -1 when the slot is free
+  int fd;                      // Answer descriptor, -1 when the slot is free
   int64_t deadline;
+  int name;                    // Index into names[] for a name lookup; -1 for a raw DNS query
   struct sockaddr_storage dst; // Where the client addressed it; the answer comes "from" there
+};
+
+// A destination the client named rather than addressed (tun2socks with fake-IP DNS does).
+struct udp_name {
+  char host[256];               // Empty when the slot is free
+  int state;                    // 0 resolving, 1 resolved, -1 does not resolve
+  int64_t expires;
+  struct sockaddr_storage addr; // Resolved address; the port comes from each datagram
+  uint8_t *held;                // The first datagram, sent once the name resolves
+  int held_len;
+  uint16_t held_port;
+  int logged_block;             // Denied: logged once per association
 };
 
 struct udp_assoc {
@@ -166,6 +181,8 @@ struct udp_assoc {
   struct sockaddr_storage peers[UDP_PEERS];
   int npeers, next_peer;
   struct udp_query q[UDP_QUERIES];
+  struct udp_name names[UDP_NAMES];
+  int next_name;
 };
 
 // One log line in the making: created for each client when --log is on, shared by
@@ -174,7 +191,7 @@ struct logrec {
   int64_t start;
   uint64_t up, down;  // Bytes client -> upstream and upstream -> client
   const char *result; // "ok", or why setup failed; NULL when there is nothing to log
-  char user[33];      // Username the client gave, if any
+  char user[65];      // Username the client gave, if any (tools and apps name themselves)
   char target[264];   // host:port it asked for
   char addr[48];      // Address actually connected to
 };
@@ -1251,10 +1268,20 @@ static void udp_cancel(struct udp_query *q) {
   q->fd = -1;
 }
 
+static void udp_forget_name(struct udp_name *nm) {
+  free(nm->held);
+  nm->held = NULL;
+  nm->host[0] = 0;
+}
+
 static void udp_expire(struct conn *c) {
   int64_t now = monotonic_ms();
-  for (int i = 0; i < UDP_QUERIES; i++)
-    if (c->ua->q[i].fd >= 0 && now >= c->ua->q[i].deadline) udp_cancel(&c->ua->q[i]);
+  for (int i = 0; i < UDP_QUERIES; i++) {
+    struct udp_query *q = &c->ua->q[i];
+    if (q->fd < 0 || now < q->deadline) continue;
+    if (q->name >= 0) udp_forget_name(&c->ua->names[q->name]);
+    udp_cancel(q);
+  }
   udp_deadline(c); // No answer is sent; the client's resolver retries or gives up
 }
 
@@ -1286,12 +1313,32 @@ static int udp_dns(struct conn *c, const struct sockaddr_storage *dst, const uin
   if (fd < 0) return 0;
   if (fd >= MAX_FDS) { res_cancel(fd); return 1; }
   slot->fd = fd;
+  slot->name = -1;
   slot->dst = *dst;
   slot->deadline = monotonic_ms() + DNS_TIMEOUT_MS;
   owner[fd] = c;
   ep_add(fd, EPOLLIN);
   udp_deadline(c);
   return 1;
+}
+
+static void udp_send(struct conn *c, const struct sockaddr_storage *dst, const uint8_t *data, int len);
+
+// A name lookup for a datagram's destination has finished (len 0: it failed).
+static void udp_name_resolved(struct conn *c, struct udp_name *nm, const uint8_t *answer, int len) {
+  struct setup tmp; // parse_answer's address list, without the rest of a setup
+  memset(&tmp, 0, sizeof tmp);
+  if (len > 0) parse_answer(answer, len, NS_T_A, &tmp);
+  nm->expires = monotonic_ms() + UDP_NAME_TTL_MS;
+  nm->state = tmp.naddr ? 1 : -1;
+  if (tmp.naddr) nm->addr = tmp.addr[0];
+  if (nm->held && tmp.naddr) {
+    struct sockaddr_storage dst = nm->addr;
+    ((struct sockaddr_in *)&dst)->sin_port = htons(nm->held_port);
+    udp_send(c, &dst, nm->held, nm->held_len);
+  }
+  free(nm->held);
+  nm->held = NULL;
 }
 
 static void udp_dns_answer(struct conn *c, struct udp_query *slot) {
@@ -1302,17 +1349,134 @@ static void udp_dns_answer(struct conn *c, struct udp_query *slot) {
   slot->fd = -1;
   int rcode = 0;
   int n = res_nresult(fd, &rcode, answer, sizeof answer); // Consumes and closes fd
-  if (n > 0) udp_to_client(c, &slot->dst, answer, n);
+  if (slot->name >= 0) {
+    udp_name_resolved(c, &c->ua->names[slot->name], answer, rcode == 0 ? n : 0);
+  } else if (n > 0) {
+    udp_to_client(c, &slot->dst, answer, n);
+  }
+  udp_deadline(c);
+}
+
+// Sends a datagram on to its destination, remembering it as a peer that may reply.
+static void udp_send(struct conn *c, const struct sockaddr_storage *dst, const uint8_t *data, int len) {
+  struct udp_assoc *ua = c->ua;
+  int v6 = dst->ss_family == AF_INET6;
+  if (ua->out[v6] < 0) {
+    int s = socket(dst->ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (s < 0) return;
+    if (s >= MAX_FDS) { close(s); return; }
+    ua->out[v6] = s;
+    owner[s] = c;
+    ep_add(s, EPOLLIN);
+  }
+  if (sendto(ua->out[v6], data, (size_t)len, 0, (const struct sockaddr *)dst, (socklen_t)sa_len(dst)) < 0)
+    return;
+  for (int i = 0; i < ua->npeers; i++)
+    if (sa_same(&ua->peers[i], dst)) return;
+  ua->peers[ua->next_peer] = *dst;
+  ua->next_peer = (ua->next_peer + 1) % UDP_PEERS;
+  if (ua->npeers < UDP_PEERS) ua->npeers++;
+}
+
+// A datagram for a named destination: sent at once if the name is known, otherwise
+// held (the first one) while Android's resolver looks it up. IPv4 only: a client
+// that cannot get through over UDP falls back to TCP (QUIC does), which dials both.
+static void udp_to_name(struct conn *c, const char *host, uint16_t port, const uint8_t *data, int len) {
+  struct udp_assoc *ua = c->ua;
+  if (deny_size && host_denied(host)) {
+    for (int i = 0; i < UDP_NAMES; i++) {
+      if (ua->names[i].logged_block && strcmp(ua->names[i].host, host) == 0) return;
+    }
+    struct udp_name *nm = &ua->names[ua->next_name];
+    ua->next_name = (ua->next_name + 1) % UDP_NAMES;
+    udp_forget_name(nm);
+    snprintf(nm->host, sizeof nm->host, "%s", host);
+    nm->state = -1;
+    nm->expires = INT64_MAX;
+    nm->logged_block = 1;
+    if (c->log) {
+      struct logrec l = { .start = monotonic_ms(), .result = "blocked" };
+      memcpy(l.user, c->log->user, sizeof l.user);
+      char target[264];
+      log_copy(target, sizeof target, host, strlen(host));
+      snprintf(l.target, sizeof l.target, "%s:%u", target, port);
+      log_emit("socks5-udp", &l);
+    }
+    return;
+  }
+  int64_t now = monotonic_ms();
+  struct udp_name *nm = NULL;
+  for (int i = 0; i < UDP_NAMES && !nm; i++)
+    if (ua->names[i].host[0] && strcasecmp(ua->names[i].host, host) == 0) nm = &ua->names[i];
+  if (nm && nm->state != 0 && now >= nm->expires) {
+    udp_forget_name(nm);
+    nm = NULL;
+  }
+  if (nm) {
+    if (nm->state == 1) {
+      struct sockaddr_storage dst = nm->addr;
+      ((struct sockaddr_in *)&dst)->sin_port = htons(port);
+      udp_send(c, &dst, data, len);
+    }
+    return; // Still resolving (the first datagram is held), or it does not resolve
+  }
+  if (!res_nquery) return;
+  struct udp_query *slot = NULL;
+  for (int i = 0; i < UDP_QUERIES && !slot; i++)
+    if (ua->q[i].fd < 0) slot = &ua->q[i];
+  if (!slot) return;
+
+  int idx = ua->next_name;
+  ua->next_name = (ua->next_name + 1) % UDP_NAMES;
+  nm = &ua->names[idx];
+  for (int i = 0; i < UDP_QUERIES; i++) // The slot's old lookup, if still running
+    if (ua->q[i].fd >= 0 && ua->q[i].name == idx) udp_cancel(&ua->q[i]);
+  udp_forget_name(nm);
+  int fd = res_nquery(0 /* NETID_UNSET */, host, NS_C_IN, NS_T_A, 0);
+  if (fd < 0) return;
+  if (fd >= MAX_FDS) { res_cancel(fd); return; }
+  snprintf(nm->host, sizeof nm->host, "%s", host);
+  nm->state = 0;
+  nm->logged_block = 0;
+  if ((nm->held = malloc((size_t)len ? (size_t)len : 1))) {
+    memcpy(nm->held, data, (size_t)len);
+    nm->held_len = len;
+    nm->held_port = port;
+  }
+  slot->fd = fd;
+  slot->name = idx;
+  slot->deadline = now + DNS_TIMEOUT_MS;
+  owner[fd] = c;
+  ep_add(fd, EPOLLIN);
   udp_deadline(c);
 }
 
 // A datagram from the client: RSV RSV FRAG ATYP DST.ADDR DST.PORT DATA.
 static void udp_from_client(struct conn *c, const uint8_t *b, int n) {
-  struct udp_assoc *ua = c->ua;
   struct sockaddr_storage dst;
-  // Fragments are not supported (RFC 1928 lets a server drop them), nor are domain
-  // names: tun2socks-style clients send the IP address they saw.
-  if (n < 4 || b[2] != 0) return;
+  // Fragments are not supported (RFC 1928 lets a server drop them).
+  if (n < 5 || b[2] != 0) return;
+  if (b[3] == 3) { // A domain name
+    int hl = b[4];
+    if (hl == 0 || n < 5 + hl + 2 || memchr(b + 5, 0, (size_t)hl)) return;
+    char host[256];
+    memcpy(host, b + 5, (size_t)hl);
+    host[hl] = 0;
+    uint16_t port = (uint16_t)(b[5 + hl] << 8 | b[6 + hl]);
+    if (port == 0) return;
+    const uint8_t *data = b + 7 + hl;
+    int len = n - 7 - hl;
+    if (c->log) {
+      c->log->up += (uint64_t)len;
+      if (!c->log->target[0]) {
+        char safe[256];
+        log_copy(safe, sizeof safe, host, (size_t)hl);
+        snprintf(c->log->target, sizeof c->log->target, "%s:%u", safe, port);
+      }
+    }
+    udp_to_name(c, host, port, data, len);
+    return;
+  }
   int alen = socks_addr(b + 3, n - 3, &dst);
   if (!alen || sa_port(&dst) == 0) return;
   const uint8_t *data = b + 3 + alen;
@@ -1322,23 +1486,7 @@ static void udp_from_client(struct conn *c, const uint8_t *b, int n) {
     if (!c->log->target[0]) format_addr(c->log->target, sizeof c->log->target, &dst);
   }
   if (sa_port(&dst) == 53 && res_nsend && udp_dns(c, &dst, data, len)) return;
-
-  int v6 = dst.ss_family == AF_INET6;
-  if (ua->out[v6] < 0) {
-    int s = socket(dst.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (s < 0) return;
-    if (s >= MAX_FDS) { close(s); return; }
-    ua->out[v6] = s;
-    owner[s] = c;
-    ep_add(s, EPOLLIN);
-  }
-  if (sendto(ua->out[v6], data, (size_t)len, 0, (struct sockaddr *)&dst, (socklen_t)sa_len(&dst)) < 0)
-    return;
-  for (int i = 0; i < ua->npeers; i++)
-    if (sa_same(&ua->peers[i], &dst)) return;
-  ua->peers[ua->next_peer] = dst;
-  ua->next_peer = (ua->next_peer + 1) % UDP_PEERS;
-  if (ua->npeers < UDP_PEERS) ua->npeers++;
+  udp_send(c, &dst, data, len);
 }
 
 // Readiness on one of an association's descriptors.
@@ -1389,6 +1537,7 @@ static void udp_close_fd(int fd) {
 
 static void udp_free(struct udp_assoc *ua) {
   if (!ua) return;
+  for (int i = 0; i < UDP_NAMES; i++) free(ua->names[i].held);
   for (int i = 0; i < UDP_QUERIES; i++)
     if (ua->q[i].fd >= 0) udp_cancel(&ua->q[i]);
   udp_close_fd(ua->relay);

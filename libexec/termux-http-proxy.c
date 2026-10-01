@@ -209,6 +209,7 @@ struct conn {
   int inflight;       // Bytes queued in pipe awaiting consumption by peer socket
   int fd_eof;         // Inbound EOF received; pending pipe data must be drained
   int want_out;       // Backpressure flag: peer socket buffer is saturated
+  int hup;            // Hung up or failed: gone once its pipe has drained to the peer
   char *req;          // Ephemeral request header buffer (allocated during ST_HEADER only)
   int req_len;        // Bytes currently buffered in req
   int in_setup;       // Client connection not yet tunnelling; counted in n_setup
@@ -593,10 +594,11 @@ static int pump(struct conn *c) {
     if (c->want_out) { c->want_out = 0; ep_mod(c); }
 
     // Pipe drained. If inbound side signaled EOF, perform half-close on peer socket.
-    // Terminate connection if both directions have completed.
+    // Terminate connection if both directions have completed, or if this socket hung
+    // up: it can take nothing more from its peer.
     if (c->fd_eof) {
       shutdown(p->fd, SHUT_WR);
-      return (p->fd_eof && p->inflight == 0) ? 0 : 1;
+      return (c->hup || (p->fd_eof && p->inflight == 0)) ? 0 : 1;
     }
 
     // Splice inbound data from socket into pipe.
@@ -604,7 +606,8 @@ static int pump(struct conn *c) {
                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (r > 0) { c->inflight += (int)r; continue; }
     if (r == 0) { c->fd_eof = 1; ep_mod(c); continue; } // EOF received; flush pipe above
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+    // Nothing more to read. A hung-up socket is out of epoll and gets no more data.
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return c->hup ? 0 : 1;
     if (errno == EINTR) continue;
     return 0;
   }
@@ -2310,6 +2313,14 @@ int main(int argc, char **argv) {
         // conn_close(p) cascades to terminate c; re-verify descriptor before proceeding.
         c = conn_get(fd);
         if (!c) continue;
+      }
+      if (e & (EPOLLERR | EPOLLHUP)) {
+        // Fully closed or reset. epoll reports that on every wait, whatever the event
+        // mask, so the socket leaves epoll: pump() drains what is left, then closes.
+        // (Before, a half-closed client that then reset spun the loop at 100% CPU
+        // until the server end closed, which can be hours.)
+        c->hup = 1;
+        epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
       }
       if (e & (EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP)) {
         if (!pump(c)) { conn_close(c); continue; }
